@@ -10,3 +10,5 @@ seaborn
 joblib
 python-dateutil
 tqdm
+supabase
+python-dotenv
