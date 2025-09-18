@@ -73,7 +73,14 @@ if run:
         st.warning(f"COT fetch failed: {e}. Proceeding with empty COT.")
         cot = pd.DataFrame()
 
-    daily_bars = bars.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+    daily_bars = bars.resample("1D").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
+
     health_df = calculate_health_gauge(cot, daily_bars)
     if health_df.empty:
         st.warning("HealthGauge computation returned empty dataframe.")
@@ -81,7 +88,7 @@ if run:
 
     latest_health = float(health_df['health_gauge'].iloc[-1])
     st.metric("Latest HealthGauge", f"{latest_health:.4f}")
-    st.line_chart(health_df[['health_gauge']].rename(columns={'health_gauge':'HealthGauge'}))
+    st.line_chart(health_df[['health_gauge']].rename(columns={'health_gauge': 'HealthGauge'}))
 
     buy_allowed = latest_health >= buy_threshold
     sell_allowed = latest_health <= sell_threshold
@@ -91,8 +98,7 @@ if run:
         st.warning("HealthGauge not in buy/sell band. Pipeline halted.")
         st.stop()
 
-# app.py – Chunk 2
-    st.info("Computing RVol and generating candidate events…")
+st.info("Computing RVol and generating candidate events…")
     bars_rvol = compute_rvol(bars, window=asset_obj.rvol_lookback)
 
     try:
@@ -114,21 +120,20 @@ if run:
         st.stop()
     st.dataframe(candidates.head())
 
-# --- Label cleaning and diagnostics before training ---
-st.info("Training XGBoost confirm model…")
+    # --- Label cleaning and diagnostics before training ---
+    st.info("Training XGBoost confirm model…")
 
-feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
+    feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
 
-# Ensure features are numeric **and fill NaNs up-front**
-for col in feat_cols:
-    candidates[col] = pd.to_numeric(candidates[col], errors='coerce').fillna(0.0)
+    # Ensure features are numeric **and fill NaNs up-front**
+    for col in feat_cols:
+        candidates[col] = pd.to_numeric(candidates[col], errors='coerce').fillna(0.0)
 
-# Drop rows that still have NaN in *label* only
-clean_candidates = candidates.dropna(subset=['label'])
+    # Drop rows that still have NaN in *label* only
+    clean_candidates = candidates.dropna(subset=['label'])
 
-# Keep only labels 0/1
-clean_candidates = clean_candidates[clean_candidates['label'].isin([0, 1])]
-
+    # Keep only labels 0/1
+    clean_candidates = clean_candidates[clean_candidates['label'].isin([0, 1])]
 
     st.write("Candidate labeling diagnostics")
     st.write(f"Labeled candidates: {len(clean_candidates)} (kept {len(clean_candidates)}/{len(candidates)})")
