@@ -1,4 +1,4 @@
-# app.py (full file) — regenerated (preserves all logic; small updates noted in comments)
+# app.py (full file)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -53,23 +53,9 @@ with st.sidebar:
     run = st.button("Run demo pipeline")
 
 if run:
-    # --- Small client-side warnings for intraday limit violations (individualized rules)
-    days_range = (end_date - start_date).days
-    if interval == "1m" and days_range > 30:
-        st.warning("Interval 1m has a 30-day max window per Yahoo. The request will be batched; expect longer fetch time and possible missing chunks.")
-    if interval in {"2m", "5m", "15m", "30m", "60m", "90m", "1h"} and days_range > 60:
-        st.warning("Selected intraday interval has a ~60-day max window per chunk. The request will be batched; expect longer fetch time.")
-
-    st.info(f"Fetching price data for {symbol} (may be batched for long ranges)…")
+    st.info(f"Fetching price data for {symbol}…")
     try:
-        # Pass max_years=15 so fetch_price can internally cap/batch up to 15 years
-        bars = fetch_price(
-            symbol,
-            start=start_date.isoformat(),
-            end=end_date.isoformat(),
-            interval=interval,
-            max_years=15,
-        )
+        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
     except Exception as e:
         st.error(f"Error fetching price: {e}")
         st.stop()
@@ -82,20 +68,12 @@ if run:
     st.info("Fetching COT and computing HealthGauge…")
     try:
         client = init_socrata_client()
-        # request up to 15 years of COT (fetch_cot will batch/thread internally)
-        cot = fetch_cot(
-            client,
-            start=(start_date - timedelta(days=365 * 15)).isoformat(),
-            end=end_date.isoformat(),
-            cot_name=asset_obj.cot_name,
-            max_years=15,
-        )
+        cot = fetch_cot(client, start=(start_date - timedelta(days=365)).isoformat(), end=end_date.isoformat())
     except Exception as e:
         st.warning(f"COT fetch failed: {e}. Proceeding with empty COT.")
         cot = pd.DataFrame()
 
-    # Build daily bars and compute gauge
-    daily_bars = bars.resample("1D").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    daily_bars = bars.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
     health_df = calculate_health_gauge(cot, daily_bars)
     if health_df.empty:
         st.warning("HealthGauge computation returned empty dataframe.")
@@ -103,7 +81,7 @@ if run:
 
     latest_health = float(health_df['health_gauge'].iloc[-1])
     st.metric("Latest HealthGauge", f"{latest_health:.4f}")
-    st.line_chart(health_df[['health_gauge']].rename(columns={'health_gauge': 'HealthGauge'}))
+    st.line_chart(health_df[['health_gauge']].rename(columns={'health_gauge':'HealthGauge'}))
 
     buy_allowed = latest_health >= buy_threshold
     sell_allowed = latest_health <= sell_threshold
@@ -114,7 +92,6 @@ if run:
         st.stop()
 
     st.info("Computing RVol and generating candidate events…")
-    # use asset-configured lookback
     bars_rvol = compute_rvol(bars, window=asset_obj.rvol_lookback)
 
     try:
@@ -124,7 +101,7 @@ if run:
             k_tp=2.0,
             k_sl=1.0,
             atr_window=asset_obj.atr_lookback,
-            max_bars=60,
+            max_bars=60
         )
     except Exception as e:
         st.error(f"Error generating candidates: {e}")
@@ -137,10 +114,17 @@ if run:
     st.dataframe(candidates.head())
 
     st.info("Training XGBoost confirm model…")
-    feat_cols = ['tick_rate', 'uptick_ratio', 'buy_vol_ratio', 'micro_range', 'rvol_micro']
+    feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
     missing = [c for c in feat_cols if c not in candidates.columns]
     if missing:
         st.error(f"Missing candidate features: {missing}")
+        st.stop()
+
+    # --- Label cleaning step before training ---
+    candidates = candidates.dropna(subset=['label'])
+    candidates = candidates[candidates['label'].isin([0, 1])]
+    if candidates.empty:
+        st.error("No valid labeled data (labels must be 0 or 1).")
         st.stop()
 
     try:
@@ -203,7 +187,6 @@ if run:
     if st.button("Save model as .pt"):
         if 'model_booster' in locals() and 'feature_list' in locals():
             model_fname = f"{model_name_input}.pt"
-            # Use torch.save to persist the model dict (compatible with earlier .pt requirement)
             torch.save({'model': model_booster, 'features': feature_list}, model_fname)
             st.success(f"Saved model to {model_fname}")
         else:
