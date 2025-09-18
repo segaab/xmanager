@@ -1,4 +1,4 @@
-# app.py (full file)
+# app.py (full file) - Part 1
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,12 +12,10 @@ import matplotlib.pyplot as plt
 import uuid
 import torch
 
-# new import
 from supabase_logger import SupabaseLogger
 from asset_objects import assets_list
 
 st.set_page_config(layout="wide", page_title="Entry Triangulation Demo")
-
 st.title("Entry-Range Triangulation Demo (HealthGauge → Entry → Confirm)")
 
 # Sidebar controls
@@ -59,7 +57,6 @@ if run:
     except Exception as e:
         st.error(f"Error fetching price: {e}")
         st.stop()
-
     if bars.empty:
         st.error("No price data returned. Check symbol and time range.")
         st.stop()
@@ -113,6 +110,7 @@ if run:
         st.stop()
     st.dataframe(candidates.head())
 
+# app.py (full file) - Part 2
     st.info("Training XGBoost confirm model…")
     feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
     missing = [c for c in feat_cols if c not in candidates.columns]
@@ -120,11 +118,14 @@ if run:
         st.error(f"Missing candidate features: {missing}")
         st.stop()
 
-    # --- Label cleaning step before training ---
+    # --- Label cleaning & validation ---
+    if 'label' not in candidates.columns:
+        st.warning("Label column missing; creating dummy labels (0) for debug purposes.")
+        candidates['label'] = 0
     candidates = candidates.dropna(subset=['label'])
-    candidates = candidates[candidates['label'].isin([0, 1])]
-    if candidates.empty:
-        st.error("No valid labeled data (labels must be 0 or 1).")
+    candidates = candidates[candidates['label'].isin([0,1])]
+    if len(candidates) < 10:
+        st.warning("Too few valid samples for training. Increase date range or adjust filters.")
         st.stop()
 
     try:
@@ -156,14 +157,14 @@ if run:
     st.write("Simulated trades:", len(trades))
 
     if not trades.empty:
-        trades['ret'] = pd.to_numeric(trades.get('ret', 0.0), errors='coerce').fillna(0.0)
-        trades['size'] = pd.to_numeric(trades.get('size', 0.0), errors='coerce').fillna(0.0)
+        trades['ret'] = pd.to_numeric(trades.get('ret',0.0), errors='coerce').fillna(0.0)
+        trades['size'] = pd.to_numeric(trades.get('size',0.0), errors='coerce').fillna(0.0)
         trades['pnl'] = trades['size'] * trades['ret']
 
         num_trades = len(trades)
         total_pnl = trades['pnl'].sum()
         avg_ret = trades['ret'].mean()
-        win_rate = (trades['ret'] > 0).sum() / num_trades
+        win_rate = (trades['ret']>0).sum()/num_trades
 
         st.metric("Num trades", f"{num_trades}")
         st.metric("Total PnL", f"{total_pnl:.6f}")
@@ -181,7 +182,7 @@ if run:
 
     st.success("Demo complete.")
 
-    # Save model as .pt
+    # Save model
     st.subheader("Save Model")
     model_name_input = st.text_input("Enter model name", value=f"confirm_model_{symbol.replace('=','_')}")
     if st.button("Save model as .pt"):
@@ -204,9 +205,9 @@ if run:
             "interval": interval,
             "feature_cols": feat_cols,
             "model_file": model_fname if 'model_fname' in locals() else None,
-            "training_params": {"num_boost_round": int(num_boost), "early_stopping_rounds": int(early_stop), "test_size": float(test_size)},
-            "health_thresholds": {"buy_threshold": float(buy_threshold), "sell_threshold": float(sell_threshold)},
-            "p_fast": float(p_fast), "p_slow": float(p_slow), "p_deep": float(p_deep),
+            "training_params": {"num_boost_round": int(num_boost),"early_stopping_rounds": int(early_stop),"test_size": float(test_size)},
+            "health_thresholds": {"buy_threshold": float(buy_threshold),"sell_threshold": float(sell_threshold)},
+            "p_fast": float(p_fast),"p_slow": float(p_slow),"p_deep": float(p_deep),
         }
         backtest_metrics = {
             "num_trades": int(num_trades) if not trades.empty else 0,
