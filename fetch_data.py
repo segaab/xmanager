@@ -1,14 +1,8 @@
-# ───────────────────────────────────────── fetch_data.py ─────────────────────────────────────────
+# fetch_data.py  (only the file contents shown — replace your existing file)
 """
 Market-data utilities with threaded, batched fetching to support up to 15 years.
 
-Fixes / features:
-• Threaded batching for Yahoo intraday & daily bars (up to 15y)
-• Threaded batching for COT fetch (yearly slices)
-• Error/warning logs for intraday ranges exceeding Yahoo limits
-• Light LRU caching for repeated interactive sessions
-• Always returns canonical OHLCV dataframe (UTC, tz-aware, deduped)
-• COT aggregation corrected
+COT fetching now includes robust retry/backoff to reduce failures (ConnectionResetError, timeouts).
 """
 
 from __future__ import annotations
@@ -23,6 +17,7 @@ from sodapy import Socrata
 from yahooquery import Ticker
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import socket
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -30,6 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # --------------------------------------------------------------------------- #
 Intraday = Literal["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]
 _DAY = timedelta(days=1)
+
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │                       low-level chunk downloader                        │
@@ -64,9 +60,16 @@ def fetch_price(
     interval: str = "1d",
     max_years: int = 15,
 ) -> pd.DataFrame:
-    """
-    Fetch price bars with threaded batching. Supports up to 15 years.
-    """
+    def _needs_chunking(ivl: str) -> bool:
+        return ivl not in {"1d", "1wk", "1mo"}
+
+    def _max_span(ivl: str) -> timedelta:
+        if ivl == "1m":
+            return timedelta(days=30)
+        if ivl in {"2m","5m","15m","30m","60m","90m","1h"}:
+            return timedelta(days=60)
+        return timedelta(days=365)  # daily+: 1 year chunking
+
     start_dt, end_dt = pd.to_datetime(start), pd.to_datetime(end)
     if start_dt >= end_dt:
         raise ValueError("`start` must be before `end`")
@@ -74,45 +77,24 @@ def fetch_price(
         logging.warning(f"Requested range > {max_years} years. Truncating to last {max_years} years.")
         start_dt = end_dt - timedelta(days=max_years*366)
 
-    # --- Determine batch size based on interval
-    def _max_span(ivl: str) -> timedelta:
-        if ivl == "1m":
-            return timedelta(days=30)
-        if ivl in {"2m","5m","15m","30m","60m","90m","1h"}:
-            return timedelta(days=60)
-        return timedelta(days=365)  # daily+: safe 1 year per batch for threading
-
     span = _max_span(interval)
-    if _max_span(interval) < (end_dt - start_dt):
-        logging.info(f"{interval} range too large for single fetch. Will batch into {span.days}-day chunks.")
+    dfs: list[pd.DataFrame] = []
 
-    # --- Create batches
-    batches = []
-    ptr = start_dt
-    while ptr < end_dt:
-        batch_end = min(ptr + span, end_dt)
-        batches.append((ptr.strftime("%Y-%m-%d"), batch_end.strftime("%Y-%m-%d")))
-        ptr = batch_end + _DAY  # avoid overlap
+    if _needs_chunking(interval) and end_dt - start_dt > span:
+        ptr = start_dt
+        while ptr < end_dt:
+            chunk_end = min(ptr + span, end_dt)
+            df_chunk = _fetch_chunk(symbol, ptr.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"), interval)
+            dfs.append(df_chunk)
+            ptr = chunk_end + _DAY
+            time.sleep(0.15)
+    else:
+        dfs.append(_fetch_chunk(symbol, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), interval))
 
-    # --- Threaded fetch
-    dfs: List[pd.DataFrame] = []
-    with ThreadPoolExecutor(max_workers=min(len(batches), 6)) as executor:
-        futures = {executor.submit(_fetch_chunk, symbol, s, e, interval): (s,e) for s,e in batches}
-        for fut in as_completed(futures):
-            s,e = futures[fut]
-            try:
-                df_chunk = fut.result()
-                if df_chunk.empty:
-                    logging.warning(f"No data for {symbol} {interval} chunk {s} → {e}")
-                dfs.append(df_chunk)
-            except Exception as exc:
-                logging.error(f"Error fetching chunk {s} → {e}: {exc}")
-
-    if not dfs:
-        return pd.DataFrame()
-
-    # --- Canonicalize
     df_raw = pd.concat(dfs, ignore_index=True)
+    if df_raw.empty:
+        return df_raw
+
     rename = {
         "date":"datetime","open":"open","high":"high","low":"low","close":"close",
         "adjclose":"adjclose","volume":"volume","Open":"open","High":"high","Low":"low",
@@ -120,7 +102,7 @@ def fetch_price(
     }
     df_raw.rename(columns=rename, inplace=True)
     if "datetime" not in df_raw.columns:
-        raise RuntimeError("No datetime column found after Yahoo fetch.")
+        raise RuntimeError("Could not locate a datetime column in yahooquery output.")
 
     if "close" not in df_raw.columns and "adjclose" in df_raw.columns:
         df_raw["close"] = df_raw["adjclose"]
@@ -136,13 +118,46 @@ def fetch_price(
         .loc[:, keep]
         .dropna(how="all")
     )
+
     out = out[~out.index.duplicated(keep="first")]
     return out
 
 
-# ───────────────────────────────── COT helpers ─────────────────────────────
+# ────────────────────────── Socrata helper with retry/backoff ───────────────
 def init_socrata_client():
-    return Socrata("publicreporting.cftc.gov", os.getenv("SOCRATA_APP_TOKEN"))
+    """
+    Initialize Socrata client. Use SOCRATA_APP_TOKEN in environment if available.
+    """
+    token = os.getenv("SOCRATA_APP_TOKEN")
+    if token is None:
+        logging.warning("Requests made without an app_token will be subject to strict throttling limits.")
+    return Socrata("publicreporting.cftc.gov", token)
+
+
+def _socrata_get_with_retry(client, dataset: str, where_clause: str, limit: int = 50_000,
+                            retries: int = 4, backoff_base: float = 1.5, timeout: float = 30.0):
+    """
+    Wrapper around client.get with retries + exponential backoff.
+    Catches common transient network errors including ConnectionResetError.
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Socrata's client.get does not accept timeout param directly in older versions;
+            # rely on the client internals but catch network errors here.
+            return client.get(dataset, where=where_clause, limit=limit)
+        except Exception as exc:
+            last_exc = exc
+            # detect connection reset / transient network issues
+            if isinstance(exc, (ConnectionResetError, socket.timeout, TimeoutError)):
+                logging.warning(f"Socrata network error (attempt {attempt}/{retries}): {exc}")
+            else:
+                logging.warning(f"Socrata error (attempt {attempt}/{retries}): {exc}")
+            sleep = backoff_base ** attempt
+            logging.info(f"Retrying in {sleep:.1f}s...")
+            time.sleep(sleep)
+    logging.error(f"Socrata fetch failed after {retries} attempts: {last_exc}")
+    raise last_exc
 
 
 def fetch_cot(
@@ -153,51 +168,63 @@ def fetch_cot(
     max_years: int = 15,
 ) -> pd.DataFrame:
     """
-    Threaded, batched COT fetch for up to 15 years.
+    Threaded, batched COT fetch for up to `max_years`. Uses _socrata_get_with_retry for robustness.
     """
     client = client or init_socrata_client()
-    start_dt, end_dt = pd.to_datetime(start) if start else None, pd.to_datetime(end) if end else pd.to_datetime("today")
-    if start_dt and (pd.Timestamp.now() - start_dt).days > max_years*366:
-        logging.warning(f"COT start > {max_years}y ago. Truncating to last {max_years}y.")
-        start_dt = pd.Timestamp.now() - timedelta(days=max_years*366)
+    start_dt = pd.to_datetime(start) if start else pd.Timestamp.now() - timedelta(days=365 * max_years)
+    end_dt = pd.to_datetime(end) if end else pd.Timestamp.now()
 
-    # Batch yearly
-    batch_start = start_dt or pd.Timestamp.now() - timedelta(days=365*max_years)
-    batch_end = batch_start + timedelta(days=365)
+    # truncate to max_years back from end_dt
+    if (end_dt - start_dt).days > max_years * 366:
+        logging.warning(f"COT start > {max_years}y ago. Truncating to last {max_years}y.")
+        start_dt = end_dt - timedelta(days=max_years * 366)
+
+    # batch per year
     batches = []
-    while batch_start < end_dt:
-        b_end = min(batch_start + timedelta(days=365), end_dt)
-        batches.append((batch_start.strftime("%Y-%m-%d"), b_end.strftime("%Y-%m-%d")))
-        batch_start = b_end + _DAY
+    ptr = start_dt
+    while ptr < end_dt:
+        b_end = min(ptr + timedelta(days=365), end_dt)
+        batches.append((ptr.strftime("%Y-%m-%d"), b_end.strftime("%Y-%m-%d")))
+        ptr = b_end + _DAY
 
     dfs: List[pd.DataFrame] = []
-    def _fetch_batch(s,e):
+
+    def _fetch_batch(s, e):
         where = [f"report_date_as_yyyy_mm_dd >= '{s}'", f"report_date_as_yyyy_mm_dd <= '{e}'"]
         if cot_name:
             where.append(f"market_and_contract_description = '{cot_name}'")
+        where_clause = " AND ".join(where)
         try:
-            res = client.get("6dca-aqww", where=" AND ".join(where), limit=50_000)
-            return pd.DataFrame.from_records(res)
+            results = _socrata_get_with_retry(client, "6dca-aqww", where_clause, limit=50_000, retries=4, backoff_base=1.5)
+            return pd.DataFrame.from_records(results)
         except Exception as exc:
             logging.error(f"COT fetch error {s}→{e}: {exc}")
             return pd.DataFrame()
 
-    with ThreadPoolExecutor(max_workers=min(len(batches),6)) as executor:
-        futures = {executor.submit(_fetch_batch, s,e):(s,e) for s,e in batches}
+    with ThreadPoolExecutor(max_workers=min(len(batches), 6)) as executor:
+        futures = {executor.submit(_fetch_batch, s, e): (s, e) for s, e in batches}
         for fut in as_completed(futures):
-            df_batch = fut.result()
-            if df_batch.empty:
-                s,e = futures[fut]
-                logging.warning(f"No COT data {s} → {e}")
-            else:
-                dfs.append(df_batch)
+            s, e = futures[fut]
+            try:
+                df_batch = fut.result()
+                if df_batch.empty:
+                    logging.warning(f"No COT data {s} → {e}")
+                else:
+                    dfs.append(df_batch)
+            except Exception as exc:
+                logging.error(f"Batch {s}→{e} raised: {exc}")
 
     if not dfs:
         return pd.DataFrame()
 
     df_all = pd.concat(dfs, ignore_index=True)
+    if "report_date_as_yyyy_mm_dd" not in df_all.columns:
+        logging.warning("COT result missing expected date column; returning empty DataFrame.")
+        return pd.DataFrame()
+
     df_all["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df_all["report_date_as_yyyy_mm_dd"])
     num_cols = [c for c in df_all.columns if c != "report_date_as_yyyy_mm_dd"]
+
     for c in num_cols:
         df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
 
@@ -205,7 +232,7 @@ def fetch_cot(
         df_all.groupby("report_date_as_yyyy_mm_dd")[num_cols]
         .sum(min_count=1)
         .reset_index()
-        .rename(columns={"report_date_as_yyyy_mm_dd":"report_date"})
+        .rename(columns={"report_date_as_yyyy_mm_dd": "report_date"})
         .sort_values("report_date")
     )
     return agg
