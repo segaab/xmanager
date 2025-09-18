@@ -1,8 +1,9 @@
-# fetch_data.py  (only the file contents shown — replace your existing file)
+# fetch_data.py
 """
 Market-data utilities with threaded, batched fetching to support up to 15 years.
 
-COT fetching now includes robust retry/backoff to reduce failures (ConnectionResetError, timeouts).
+COT fetching includes robust retry/backoff to reduce failures (ConnectionResetError, timeouts),
+with extended timeout support.
 """
 
 from __future__ import annotations
@@ -124,31 +125,30 @@ def fetch_price(
 
 
 # ────────────────────────── Socrata helper with retry/backoff ───────────────
-def init_socrata_client():
+def init_socrata_client(timeout: float = 500.0) -> Socrata:
     """
     Initialize Socrata client. Use SOCRATA_APP_TOKEN in environment if available.
+    Extended timeout defaults to 500s to prevent large-range fetch failures.
     """
     token = os.getenv("SOCRATA_APP_TOKEN")
     if token is None:
         logging.warning("Requests made without an app_token will be subject to strict throttling limits.")
-    return Socrata("publicreporting.cftc.gov", token)
+    client = Socrata("publicreporting.cftc.gov", token, timeout=timeout)
+    return client
 
 
 def _socrata_get_with_retry(client, dataset: str, where_clause: str, limit: int = 50_000,
-                            retries: int = 4, backoff_base: float = 1.5, timeout: float = 30.0):
+                            retries: int = 4, backoff_base: float = 1.5):
     """
     Wrapper around client.get with retries + exponential backoff.
-    Catches common transient network errors including ConnectionResetError.
+    Catches common transient network errors including ConnectionResetError and timeouts.
     """
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
-            # Socrata's client.get does not accept timeout param directly in older versions;
-            # rely on the client internals but catch network errors here.
             return client.get(dataset, where=where_clause, limit=limit)
         except Exception as exc:
             last_exc = exc
-            # detect connection reset / transient network issues
             if isinstance(exc, (ConnectionResetError, socket.timeout, TimeoutError)):
                 logging.warning(f"Socrata network error (attempt {attempt}/{retries}): {exc}")
             else:
@@ -174,7 +174,6 @@ def fetch_cot(
     start_dt = pd.to_datetime(start) if start else pd.Timestamp.now() - timedelta(days=365 * max_years)
     end_dt = pd.to_datetime(end) if end else pd.Timestamp.now()
 
-    # truncate to max_years back from end_dt
     if (end_dt - start_dt).days > max_years * 366:
         logging.warning(f"COT start > {max_years}y ago. Truncating to last {max_years}y.")
         start_dt = end_dt - timedelta(days=max_years * 366)
@@ -189,13 +188,13 @@ def fetch_cot(
 
     dfs: List[pd.DataFrame] = []
 
-    def _fetch_batch(s, e):
+    def _fetch_batch(s: str, e: str) -> pd.DataFrame:
         where = [f"report_date_as_yyyy_mm_dd >= '{s}'", f"report_date_as_yyyy_mm_dd <= '{e}'"]
         if cot_name:
             where.append(f"market_and_contract_description = '{cot_name}'")
         where_clause = " AND ".join(where)
         try:
-            results = _socrata_get_with_retry(client, "6dca-aqww", where_clause, limit=50_000, retries=4, backoff_base=1.5)
+            results = _socrata_get_with_retry(client, "6dca-aqww", where_clause, limit=50_000)
             return pd.DataFrame.from_records(results)
         except Exception as exc:
             logging.error(f"COT fetch error {s}→{e}: {exc}")
