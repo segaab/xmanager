@@ -16,6 +16,7 @@ import uuid
 
 # new import
 from supabase_logger import SupabaseLogger
+from assets_list import assets_list  # new modal for asset objects
 
 st.set_page_config(layout="wide", page_title="Entry Triangulation Demo")
 
@@ -23,8 +24,13 @@ st.title("Entry-Range Triangulation Demo (HealthGauge → Entry → Confirm)")
 
 # Sidebar controls: data selection + training + thresholds
 with st.sidebar:
+    st.header("Asset Selection")
+    asset_names = [a.name for a in assets_list]
+    selected_asset_name = st.selectbox("Select asset", options=asset_names, index=0)
+    asset = next(a for a in assets_list if a.name == selected_asset_name)
+
+    st.markdown("---")
     st.header("Data / Run Controls")
-    symbol = st.text_input("Symbol (Yahoo)", value="GC=F")
     start_date = st.date_input("Start date", value=date.today() - timedelta(days=180))
     end_date = st.date_input("End date", value=date.today())
     interval = st.selectbox("Bar interval", options=["1m", "5m", "1h", "1d"], index=1)
@@ -53,10 +59,9 @@ with st.sidebar:
     run = st.button("Run demo pipeline")
 
 if run:
-    # ... [FETCHING & PREPROCESSING as before] ...
-    st.info("Fetching price data (yahooquery)… this may take a few seconds.")
+    st.info(f"Fetching price data for {asset.symbol} (yahooquery)… this may take a few seconds.")
     try:
-        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
+        bars = fetch_price(asset.symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
     except Exception as e:
         st.error(f"Error fetching price: {e}")
         st.stop()
@@ -64,14 +69,15 @@ if run:
     if bars.empty:
         st.error("No price data returned. Check symbol and time range.")
         st.stop()
-
     st.success(f"Fetched {len(bars)} bars ({interval}).")
 
-    # Compute daily health gauge
-    st.info("Fetching COT (socrata) and computing HealthGauge…")
+    st.info(f"Fetching COT data for {asset.cot_name} (socrata)…")
     try:
         client = init_socrata_client()
-        cot = fetch_cot(client, start=(start_date - timedelta(days=365)).isoformat(), end=end_date.isoformat())
+        cot = fetch_cot(client,
+                        start=(start_date - timedelta(days=365)).isoformat(),
+                        end=end_date.isoformat(),
+                        cot_name=asset.cot_name)
     except Exception as e:
         st.warning(f"Error fetching COT or Socrata client init: {e}. Proceeding with empty COT (health gauge will be based on volume proxies).")
         cot = pd.DataFrame()
@@ -99,10 +105,10 @@ if run:
         st.stop()
 
     st.info("Computing RVol and generating candidate events (labels)…")
-    bars_rvol = compute_rvol(bars, window=20)
+    bars_rvol = compute_rvol(bars, window=asset.rvol_lookback)
 
     try:
-        candidates = generate_candidates_and_labels(bars_rvol, lookback=64, k_tp=2.0, k_sl=1.0, atr_window=20, max_bars=60)
+        candidates = generate_candidates_and_labels(bars_rvol, lookback=64, k_tp=2.0, k_sl=1.0, atr_window=asset.atr_lookback, max_bars=60)
     except Exception as e:
         st.error(f"Error generating candidates: {e}")
         st.stop()
@@ -150,7 +156,6 @@ if run:
 
     # Compute and display trade metrics
     if not trades.empty:
-        # Ensure numeric ret/pnl
         trades['ret'] = pd.to_numeric(trades.get('ret', 0.0), errors='coerce').fillna(0.0)
         trades['size'] = pd.to_numeric(trades.get('size', 0.0), errors='coerce').fillna(0.0)
         trades['pnl'] = trades['size'] * trades['ret']
@@ -167,7 +172,6 @@ if run:
         st.metric("Average return / filled trade", f"{avg_ret:.6f}")
         st.metric("Win rate", f"{win_rate:.2%}")
 
-        # Show table & simple PnL curve
         st.dataframe(trades.head())
 
         pnl_series = trades.groupby('candidate_time')['pnl'].sum().cumsum()
@@ -182,20 +186,20 @@ if run:
 
     # Save model & optionally log to Supabase
     if st.button("Save model & feature list"):
-        model_fname = f'confirm_model_{symbol.replace("=","_")}_{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}.pkl'
+        model_fname = f'confirm_model_{asset.symbol.replace("=","_")}_{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}.pkl'
         joblib.dump({'model': model_booster, 'features': feature_list}, model_fname)
         st.write(f"Saved model to {model_fname}")
 
-    # New: Save logs to Supabase
+    # Log to Supabase
     st.markdown("---")
     st.subheader("Logging")
     st.write("You can log this run's summary metrics and per-trade records to Supabase for later analysis.")
     if st.button("Save logs to Supabase"):
-        # Build metadata & metrics dictionaries
         run_id = str(uuid.uuid4())
         metadata = {
             "run_id": run_id,
-            "symbol": symbol,
+            "asset_name": asset.name,
+            "symbol": asset.symbol,
             "start_date": str(start_date),
             "end_date": str(end_date),
             "interval": interval,
@@ -205,7 +209,7 @@ if run:
             "health_thresholds": {"buy_threshold": float(buy_threshold), "sell_threshold": float(sell_threshold)},
             "p_fast": float(p_fast), "p_slow": float(p_slow), "p_deep": float(p_deep),
         }
-        # Collect metrics (combine training metrics and backtest metrics)
+
         backtest_metrics = {
             "num_trades": int(num_trades) if not trades.empty else 0,
             "total_pnl": float(total_pnl) if not trades.empty else 0.0,
@@ -218,12 +222,9 @@ if run:
         combined_metrics = dict(metrics)
         combined_metrics.update(backtest_metrics)
 
-        # Prepare trades for logging as list of dicts (if any)
         trade_list = []
         if not trades.empty:
-            # ensure safe objects (convert timestamps to strings)
             for r in trades.to_dict(orient="records"):
-                # add small set of fields for storage
                 trade_list.append({
                     "candidate_time": str(r.get("candidate_time")),
                     "layer": r.get("layer"),
@@ -234,7 +235,6 @@ if run:
                     "pnl": float(r.get("pnl") or 0.0),
                 })
 
-        # Initialize supabase client and log
         try:
             supa = SupabaseLogger()
             run_id_returned = supa.log_run(metrics=combined_metrics, metadata=metadata, trades=trade_list)
