@@ -18,22 +18,41 @@ def fetch_price(symbol: str, start: str, end: str, interval: str = "1m"):
     except Exception as e:
         raise RuntimeError(f"yahooquery fetch error: {e}")
 
+    # Handle dict return (multi-symbol)
     if isinstance(hist, dict):
         hist = hist.get(symbol, pd.DataFrame())
 
     if hist.empty:
+        print(f"Warning: No data returned for {symbol} from {start} to {end} with interval {interval}.")
         return pd.DataFrame()
 
+    # Handle MultiIndex (symbol/date) if present
+    if isinstance(hist.index, pd.MultiIndex):
+        hist = hist.reset_index(level=0, drop=True).reset_index()
+
+    # Normalize column names
     df = hist.reset_index().rename(columns={'date':'datetime'})
+    if 'datetime' not in df.columns and 'level_0' in df.columns:
+        df.rename(columns={'level_0':'datetime'}, inplace=True)
     df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
     df = df.set_index('datetime').sort_index()
+
+    # Keep OHLCV if exists, otherwise try adjclose as close
+    for col in ['open','high','low','close','volume']:
+        if col not in df.columns:
+            if col == 'close' and 'adjclose' in df.columns:
+                df['close'] = df['adjclose']
+            else:
+                df[col] = 0.0
+
     df = df[['open','high','low','close','volume']].copy()
     return df
 
 def init_socrata_client():
     """
-    Initialize Socrata client using environment variables:
-    SOCRATA_APP_TOKEN, SOCRATA_USERNAME, SOCRATA_PASSWORD
+    Initialize Socrata client using environment variable:
+    SOCRATA_APP_TOKEN
+    Username/password removed for anonymous access.
     """
     app_token = os.getenv("SOCRATA_APP_TOKEN")
     client = Socrata("publicreporting.cftc.gov", app_token)
@@ -62,6 +81,7 @@ def fetch_cot(client=None, start=None, end=None, cot_name=None):
     results = client.get("6dca-aqww", where=where, limit=50000)
     df = pd.DataFrame.from_records(results)
     if df.empty:
+        print(f"Warning: No COT data returned for {cot_name} between {start} and {end}")
         return df
 
     # canonicalize types
