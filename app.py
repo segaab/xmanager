@@ -114,26 +114,21 @@ if run:
         st.stop()
     st.dataframe(candidates.head())
 
-    # --- Label cleaning and diagnostics before training ---
-    st.info("Training XGBoost confirm model…")
+# --- Label cleaning and diagnostics before training ---
+st.info("Training XGBoost confirm model…")
 
-    feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
+feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
 
-    # Ensure features exist
-    missing = [c for c in feat_cols if c not in candidates.columns]
-    if missing:
-        st.error(f"Missing candidate features: {missing}")
-        st.stop()
+# Ensure features are numeric **and fill NaNs up-front**
+for col in feat_cols:
+    candidates[col] = pd.to_numeric(candidates[col], errors='coerce').fillna(0.0)
 
-    # Ensure numeric dtype for XGBoost
-    for col in feat_cols:
-        candidates[col] = pd.to_numeric(candidates[col], errors='coerce')
+# Drop rows that still have NaN in *label* only
+clean_candidates = candidates.dropna(subset=['label'])
 
-    # Drop rows with any NaN in features or label
-    clean_candidates = candidates.dropna(subset=feat_cols + ['label'])
+# Keep only labels 0/1
+clean_candidates = clean_candidates[clean_candidates['label'].isin([0, 1])]
 
-    # Keep only labels 0/1
-    clean_candidates = clean_candidates[clean_candidates['label'].isin([0,1])]
 
     st.write("Candidate labeling diagnostics")
     st.write(f"Labeled candidates: {len(clean_candidates)} (kept {len(clean_candidates)}/{len(candidates)})")
