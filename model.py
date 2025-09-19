@@ -14,22 +14,18 @@ logging.basicConfig(level=logging.INFO)
 
 class BoosterWrapper:
     """
-    Thin sklearn-like wrapper around an xgboost.Booster trained with xgb.train.
-    Provides predict_proba and predict to behave like sklearn estimators.
+    Wrap an xgboost.Booster to provide predict_proba / predict similar to sklearn estimators.
     """
     def __init__(self, booster: xgb.Booster, feature_names: List[str]):
         self.booster = booster
         self.feature_names = feature_names
-        # best_iteration may or may not exist depending on training call
         self.best_iteration = getattr(booster, "best_iteration", None)
 
-    def _dmatrix(self, X: pd.DataFrame):
-        # ensure columns ordering
-        if isinstance(X, pd.DataFrame):
-            Xp = X[self.feature_names].copy()
-        else:
-            # assume array-like, convert to DataFrame with feature_names
-            Xp = pd.DataFrame(X, columns=self.feature_names)
+    def _dmatrix(self, X: pd.DataFrame) -> xgb.DMatrix:
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=self.feature_names)
+        # ensure ordering
+        Xp = X.reindex(columns=self.feature_names).fillna(0.0)
         return xgb.DMatrix(Xp, feature_names=self.feature_names)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
@@ -38,15 +34,13 @@ class BoosterWrapper:
             raw = self.booster.predict(dmat, iteration_range=(0, int(self.best_iteration) + 1))
         else:
             raw = self.booster.predict(dmat)
-        # raw are probabilities for positive class (binary:logistic)
         raw = np.asarray(raw, dtype=float)
-        # return shape (n_samples, 2) like sklearn: [prob_neg, prob_pos]
         probs = np.vstack([1.0 - raw, raw]).T
         return probs
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        probs = self.predict_proba(X)[:, 1]
-        return (probs >= 0.5).astype(int)
+        proba = self.predict_proba(X)[:, 1]
+        return (proba >= 0.5).astype(int)
 
 
 def train_xgb_confirm(
@@ -60,48 +54,44 @@ def train_xgb_confirm(
     early_stopping_rounds: Optional[int] = None,
 ) -> Tuple[Any, List[str], Dict[str, Any]]:
     """
-    Train a binary confirm model using xgboost.train (robust to sklearn-fit kwargs differences).
+    Train xgboost via xgb.train with class-weight handling (scale_pos_weight).
     Returns (model_wrapper, feature_cols, metrics).
     """
-    # --------------------- validation & sanitization -------------------------
+    # validation
     missing = [c for c in feature_cols if c not in clean.columns]
     if missing:
         raise KeyError(f"Missing feature columns in training data: {missing}")
     if label_col not in clean.columns:
         raise KeyError(f"Label column '{label_col}' missing in training data")
 
-    X = clean[feature_cols].copy()
-    y = clean[label_col].copy()
+    X_all = clean[feature_cols].copy().apply(pd.to_numeric, errors="coerce")
+    y_all = pd.to_numeric(clean[label_col], errors="coerce")
 
-    # coerce numeric
-    X = X.apply(pd.to_numeric, errors="coerce")
-    y = pd.to_numeric(y, errors="coerce")
+    mask_valid = X_all.replace([np.inf, -np.inf], np.nan).notnull().all(axis=1) & y_all.notnull() & np.isfinite(y_all)
+    X_all = X_all.loc[mask_valid].reset_index(drop=True)
+    y_all = y_all.loc[mask_valid].reset_index(drop=True)
 
-    # drop rows with NaN / Inf in features or labels
-    finite_mask = X.replace([np.inf, -np.inf], np.nan).notnull().all(axis=1) & y.notnull() & np.isfinite(y)
-    n_before = len(X)
-    X = X.loc[finite_mask].reset_index(drop=True)
-    y = y.loc[finite_mask].reset_index(drop=True)
-    n_after = len(X)
-    logger.info("train_xgb_confirm: rows before cleaning=%d, after=%d", n_before, n_after)
+    if X_all.empty:
+        raise ValueError("No training data left after cleaning")
 
-    if n_after == 0:
-        raise ValueError("No training data left after cleaning (all rows dropped due to NaN/Inf).")
+    n_pos = int((y_all == 1).sum())
+    n_neg = int((y_all == 0).sum())
+    logger.info("Labels: pos=%d neg=%d", n_pos, n_neg)
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError(f"Need both classes present to train (pos={n_pos}, neg={n_neg})")
 
-    unique_classes = np.unique(y)
-    if len(unique_classes) < 2:
-        raise ValueError(f"Only one class present in labels: {unique_classes}. Need both classes to train.")
+    # compute scale_pos_weight
+    scale_pos_weight = float(n_neg) / max(1.0, float(n_pos))
 
-    # stratified split when possible
-    stratify = y if len(unique_classes) == 2 else None
+    # train/val split (stratified)
+    stratify = y_all if len(np.unique(y_all)) == 2 else None
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, shuffle=True, stratify=stratify
+        X_all, y_all, test_size=test_size, random_state=random_state, shuffle=True, stratify=stratify
     )
     logger.info("train_xgb_confirm: train rows=%d, val rows=%d", len(X_train), len(X_val))
     if len(X_train) < 2 or len(X_val) < 1:
-        raise ValueError("Not enough data after train/val split. Try increasing dataset or changing test_size.")
+        raise ValueError("Not enough data after train/val split")
 
-    # --------------------- prepare DMatrix & params --------------------------
     dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_cols)
     dval = xgb.DMatrix(X_val, label=y_val, feature_names=feature_cols)
 
@@ -113,11 +103,10 @@ def train_xgb_confirm(
         "colsample_bytree": 0.8,
         "eval_metric": "logloss",
         "verbosity": 1 if verbose else 0,
+        "scale_pos_weight": scale_pos_weight,
     }
 
     evals = [(dval, "validation")]
-
-    # --------------------- train via xgb.train (supports early stopping robustly) ----------------
     try:
         bst = xgb.train(
             params,
@@ -128,9 +117,7 @@ def train_xgb_confirm(
             verbose_eval=verbose,
         )
     except TypeError as te:
-        # fallback: some xgboost builds may not accept early_stopping_rounds param here;
-        # try without early stopping and warn.
-        logger.warning("xgb.train raised TypeError (%s). Retrying without early stopping.", te)
+        logger.warning("xgb.train TypeError (%s). Retrying without early_stopping_rounds.", te)
         bst = xgb.train(
             params,
             dtrain,
@@ -139,15 +126,14 @@ def train_xgb_confirm(
             verbose_eval=verbose,
         )
 
-    # wrap booster for sklearn-like interface
     model_wrapper = BoosterWrapper(bst, feature_names=feature_cols)
 
-    # --------------------- evaluation metrics on validation set ----------------
+    # evaluate on validation set
     try:
         y_proba_val = model_wrapper.predict_proba(X_val)[:, 1]
         y_pred_val = (y_proba_val >= 0.5).astype(int)
     except Exception as exc:
-        logger.warning("Could not compute proba on validation set via booster: %s. Falling back to zeros.", exc)
+        logger.warning("Could not compute prediction on validation set: %s", exc)
         y_proba_val = np.zeros(len(y_val), dtype=float)
         y_pred_val = np.zeros(len(y_val), dtype=int)
 
@@ -156,7 +142,7 @@ def train_xgb_confirm(
         "n_val": int(len(X_val)),
         "accuracy": float(accuracy_score(y_val, y_pred_val)),
         "f1": float(f1_score(y_val, y_pred_val, zero_division=0)),
-        "val_proba_mean": float(np.nanmean(y_proba_val)) if len(y_proba_val) > 0 else 0.0,
+        "val_proba_mean": float(np.nanmean(y_proba_val)) if y_proba_val.size > 0 else 0.0,
     }
     if len(np.unique(y_val)) == 2:
         try:
@@ -173,9 +159,7 @@ def train_xgb_confirm(
 def predict_confirm_prob(model: Any, candidates: pd.DataFrame, feature_cols: List[str]) -> pd.Series:
     """
     Predict positive-class probability for each row in `candidates`.
-
-    Accepts a BoosterWrapper (or any model with predict_proba) and returns a pd.Series
-    indexed like candidates.index with name 'confirm_proba'.
+    Returns pd.Series indexed as candidates.index.
     """
     if candidates is None or len(candidates) == 0:
         return pd.Series(dtype=float)
@@ -185,13 +169,12 @@ def predict_confirm_prob(model: Any, candidates: pd.DataFrame, feature_cols: Lis
 
     missing = [c for c in feature_cols if c not in candidates.columns]
     if missing:
-        logger.warning("predict_confirm_prob: missing feature columns in candidates, filling with 0: %s", missing)
+        logger.warning("predict_confirm_prob: missing feature cols, filling with 0: %s", missing)
         for m in missing:
             candidates[m] = 0.0
 
     X = candidates[feature_cols].copy().apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-    # If model has predict_proba, use it; otherwise attempt predict and convert to float
     try:
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X)[:, 1]
