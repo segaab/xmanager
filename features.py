@@ -1,13 +1,19 @@
+# features.py
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+import logging
 
-# -----------------------------------------------------------------------------#
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
 def _safe_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     """Return df[col] coerced to numeric; if missing → Series[default]."""
     if col in df.columns:
         return pd.to_numeric(df[col], errors="coerce").fillna(default)
     return pd.Series(default, index=df.index, dtype=float)
+
 
 def _safe_series_any(df: pd.DataFrame, cols: list[str], default: float = 0.0) -> pd.Series:
     """Pick the first existing column in *cols*; else return default series."""
@@ -16,134 +22,133 @@ def _safe_series_any(df: pd.DataFrame, cols: list[str], default: float = 0.0) ->
             return pd.to_numeric(df[c], errors="coerce").fillna(default)
     return pd.Series(default, index=df.index, dtype=float)
 
-# -----------------------------------------------------------------------------#
+
 def compute_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Compute relative volume (rvol) as volume / rolling_median(volume, window).
+    Returns a copy of the input df with 'volume_avg' and 'rvol' columns.
+    """
     out = df.copy()
     out["volume_avg"] = out["volume"].rolling(window, min_periods=1).median()
     out["rvol"] = out["volume"] / (out["volume_avg"] + 1e-9)
+    out["rvol"] = out["rvol"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return out
 
-# -----------------------------------------------------------------------------#
+
 def calculate_health_gauge(
     cot_df: pd.DataFrame,
     daily_bars: pd.DataFrame,
     mom_window: int = 14,
 ) -> pd.DataFrame:
     """
-    Creates a daily dataframe with
-        • health_gauge           ∊ [0,1]
-        • noncomm_net_chg        (raw # contracts)
-        • comm_net_chg           (raw # contracts)
-    This version is robust to duplicate/unsorted indexes by normalizing and deduping.
+    Create a daily dataframe with:
+      - health_gauge (0..1)
+      - noncomm_net_chg
+      - comm_net_chg
+
+    Robust to duplicate/unsorted indexes by normalizing and deduping.
     """
-    # --- Prepare price frame: ensure datetime index, sorted and unique -------------
+    if daily_bars is None or daily_bars.empty:
+        raise ValueError("daily_bars must be a non-empty DataFrame with a datetime index and 'close' column.")
+
     price_df = daily_bars.copy()
     if not isinstance(price_df.index, pd.DatetimeIndex):
         price_df.index = pd.to_datetime(price_df.index)
     price_df = price_df.sort_index()
     if price_df.index.duplicated().any():
+        logger.warning("Duplicate indices found in daily_bars — keeping last occurrence per index.")
         price_df = price_df[~price_df.index.duplicated(keep="last")]
 
-    # baseline 35%
+    # baseline
     gauge = pd.Series(0.35, index=price_df.index, dtype=float)
 
-    # ---------- COT block (40 %) ---------------------------------------------
+    # COT processing (40%)
     if cot_df is not None and not cot_df.empty:
-        cot_df = cot_df.copy()
-
-        # if report_date column exists, convert and set as index; else ensure index is datetime
-        if "report_date" in cot_df.columns:
-            cot_df["report_date"] = pd.to_datetime(cot_df["report_date"])
-            cot_df = cot_df.sort_values("report_date").set_index("report_date")
+        cot = cot_df.copy()
+        if "report_date" in cot.columns:
+            cot["report_date"] = pd.to_datetime(cot["report_date"])
+            cot = cot.sort_values("report_date").set_index("report_date")
         else:
-            if not isinstance(cot_df.index, pd.DatetimeIndex):
-                cot_df.index = pd.to_datetime(cot_df.index)
-            cot_df = cot_df.sort_index()
+            if not isinstance(cot.index, pd.DatetimeIndex):
+                cot.index = pd.to_datetime(cot.index)
+            cot = cot.sort_index()
 
-        # remove duplicate dates in cot_df index (keep last)
-        if cot_df.index.duplicated().any():
-            cot_df = cot_df[~cot_df.index.duplicated(keep="last")]
+        if cot.index.duplicated().any():
+            logger.warning("Duplicate indices in COT data — keeping last per index.")
+            cot = cot[~cot.index.duplicated(keep="last")]
 
-        # fetch long/short legs (multiple dataset aliases supported)
-        nc_long = _safe_series_any(cot_df, ["noncommercial_long", "noncomm_positions_long_all"])
-        nc_short = _safe_series_any(cot_df, ["noncommercial_short", "noncomm_positions_short_all"])
-        c_long = _safe_series_any(cot_df, ["commercial_long", "comm_positions_long_all"])
-        c_short = _safe_series_any(cot_df, ["commercial_short", "comm_positions_short_all"])
-        # open_interest optionally used elsewhere
-        open_int = _safe_series_any(cot_df, ["open_interest", "open_interest_all"], default=np.nan)
+        # pick candidate columns robustly
+        nc_long = _safe_series_any(cot, ["noncommercial_long", "noncomm_positions_long_all", "noncommercial_long_all"])
+        nc_short = _safe_series_any(cot, ["noncommercial_short", "noncomm_positions_short_all", "noncommercial_short_all"])
+        c_long = _safe_series_any(cot, ["commercial_long", "comm_positions_long_all", "commercial_long_all"])
+        c_short = _safe_series_any(cot, ["commercial_short", "comm_positions_short_all", "commercial_short_all"])
 
-        # net & net-change (index == cot_df.index)
-        nc_net_chg = (nc_long - nc_short).diff().fillna(0)
-        c_net_chg = (c_long - c_short).diff().fillna(0)
+        nc_net = (nc_long - nc_short).fillna(0.0)
+        c_net = (c_long - c_short).fillna(0.0)
 
-        # ensure unique indexes on the net-change (should be unique after deduping cot_df)
-        if nc_net_chg.index.duplicated().any():
-            nc_net_chg = nc_net_chg[~nc_net_chg.index.duplicated(keep="last")]
-        if c_net_chg.index.duplicated().any():
-            c_net_chg = c_net_chg[~c_net_chg.index.duplicated(keep="last")]
+        # net change (diff)
+        nc_net_chg = nc_net.diff().fillna(0.0)
+        c_net_chg = c_net.diff().fillna(0.0)
 
-        # normalise to ±1 using MAD-scale for robustness
+        # normalize by MAD, robust
         def _norm(s: pd.Series) -> pd.Series:
             if s.empty:
-                return pd.Series([], index=s.index, dtype=float)
+                return pd.Series(0.0, index=price_df.index, dtype=float)
             mad = s.abs().median()
             if mad == 0 or np.isnan(mad):
-                return pd.Series(0, index=s.index, dtype=float)
-            return (s / (5 * mad)).clip(-1, 1)  # 5×MAD ≈ 3 σ
+                return pd.Series(0.0, index=s.index, dtype=float)
+            return (s / (5.0 * mad)).clip(-1.0, 1.0)
 
         nc_norm = _norm(nc_net_chg)
         c_norm = _norm(c_net_chg)
 
-        # guard against duplicated index on normalized series
-        if nc_norm.index.duplicated().any():
-            nc_norm = nc_norm[~nc_norm.index.duplicated(keep="last")]
-        if c_norm.index.duplicated().any():
-            c_norm = c_norm[~c_norm.index.duplicated(keep="last")]
-
-        # align with daily price index and interpolate in time (requires datetime index)
-        # reindex source (nc_norm) to target index (price_df.index)
-        nc_interp = nc_norm.reindex(price_df.index).interpolate(method="time").fillna(0)
-        c_interp = c_norm.reindex(price_df.index).interpolate(method="time").fillna(0)
+        # align to price index using time interpolation where necessary
+        try:
+            nc_interp = nc_norm.reindex(price_df.index).interpolate(method="time").fillna(0.0)
+            c_interp = c_norm.reindex(price_df.index).interpolate(method="time").fillna(0.0)
+        except Exception:
+            # fallback: nearest fill
+            nc_interp = nc_norm.reindex(price_df.index).ffill().fillna(0.0)
+            c_interp = c_norm.reindex(price_df.index).ffill().fillna(0.0)
 
         gauge += 0.20 * nc_interp
         gauge += 0.20 * c_interp
 
+        nc_out = nc_net_chg.reindex(price_df.index).fillna(0.0)
+        c_out = c_net_chg.reindex(price_df.index).fillna(0.0)
     else:
-        # no cot data: zero series for net-change with price index
-        nc_net_chg = pd.Series(0, index=price_df.index, dtype=float)
-        c_net_chg = pd.Series(0, index=price_df.index, dtype=float)
+        # no cot
+        nc_out = pd.Series(0.0, index=price_df.index, dtype=float)
+        c_out = pd.Series(0.0, index=price_df.index, dtype=float)
 
-    # ---------- Momentum / realised-vol block (25 %) --------------------------
-    # make sure 'close' exists
+    # momentum / realized vol (25%)
     if "close" not in price_df.columns:
-        raise KeyError("daily_bars must contain a 'close' column")
+        raise KeyError("daily_bars must contain 'close' for health gauge computation.")
 
-    ret = price_df["close"].pct_change().fillna(0)
+    ret = price_df["close"].pct_change().fillna(0.0)
     mom = ret.rolling(mom_window, min_periods=1).mean()
     vol = ret.rolling(mom_window, min_periods=1).std()
 
-    mom_norm = (mom / (mom.abs().max() or 1)).clip(-1, 1)
-    vol_norm = (vol / (vol.max() or 1)).clip(0, 1)
+    mom_norm = (mom / (mom.abs().max() or 1.0)).clip(-1.0, 1.0)
+    vol_norm = (vol / (vol.max() or 1.0)).clip(0.0, 1.0)
 
     gauge += 0.15 * mom_norm
     gauge -= 0.10 * vol_norm
 
-    # ---------- Final clip & return ------------------------------------------
-    # reindex raw net-change series to the price index (safe because we ensured uniqueness above)
-    try:
-        nc_out = nc_net_chg.reindex(price_df.index).fillna(0)
-        c_out = c_net_chg.reindex(price_df.index).fillna(0)
-    except ValueError:
-        # last-resort: if something unexpected still has dupes, produce zero-series
-        nc_out = pd.Series(0, index=price_df.index, dtype=float)
-        c_out = pd.Series(0, index=price_df.index, dtype=float)
+    gauge = gauge.clip(0.0, 1.0)
 
     out = pd.DataFrame(
         {
-            "health_gauge": gauge.clip(0, 1),
+            "health_gauge": gauge,
             "noncomm_net_chg": nc_out,
             "comm_net_chg": c_out,
         },
         index=price_df.index,
     )
+
+    # ensure dtypes
+    out["health_gauge"] = out["health_gauge"].astype(float)
+    out["noncomm_net_chg"] = out["noncomm_net_chg"].astype(float)
+    out["comm_net_chg"] = out["comm_net_chg"].astype(float)
+
     return out
