@@ -1,9 +1,20 @@
 # labeling.py
-import pandas as pd
-import numpy as np
 import logging
+from typing import List, Dict, Any, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1).fillna(close.iloc[0])
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
 
 def generate_candidates_and_labels(
@@ -17,72 +28,136 @@ def generate_candidates_and_labels(
     direction: str = "long",
 ) -> pd.DataFrame:
     """
-    Generate trade candidates with entry, stop, target, and labels.
-    Micro-features are numeric and default to 0.0 if missing.
-    """
-    candidates = []
+    Generate trade candidates with ATR-based SL/TP and triple-barrier-like labeling using a fixed-horizon.
 
-    if df.empty:
-        logging.warning("Input bars dataframe is empty. Returning empty candidates.")
+    - SL = entry_price +/- k_sl * ATR(atr_window)
+    - TP = entry_price +/- k_tp * ATR(atr_window)  (k_tp typically = 3.0 for 3R)
+    - Label = 1 if TP is hit before SL within max_bars forward bars, else 0.
+    - If neither barrier is hit before max_bars, label = 0 (vertical barrier).
+    - Micro-features are filled with numeric defaults (0.0) if missing.
+
+    Returns DataFrame with candidate records (one row per candidate).
+    """
+    if df is None or df.empty:
+        logger.warning("Input bars dataframe is empty. Returning empty DataFrame.")
         return pd.DataFrame()
 
-    # Example rolling ATR calculation
-    df["atr"] = df["close"].rolling(atr_window).apply(
-        lambda x: x.max() - x.min(), raw=False
-    )
+    # ensure index is datetime and sorted
+    df = df.copy()
+    df.index = pd.to_datetime(df.index, utc=True)
+    df = df.sort_index()
+    if df.index.duplicated().any():
+        logger.warning("Duplicate timestamps in bars — keeping first occurrence.")
+        df = df[~df.index.duplicated(keep="first")]
 
-    # Candidate generation loop (simplified)
-    for i in range(lookback, len(df)):
+    required_cols = {"high", "low", "close"}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise KeyError(f"bars dataframe missing required columns for ATR calculation: {missing_cols}")
+
+    # True Range -> ATR (simple rolling mean of TR)
+    df["tr"] = _true_range(df["high"], df["low"], df["close"])
+    df["atr"] = df["tr"].rolling(window=atr_window, min_periods=1).mean().fillna(method="ffill").fillna(0.0)
+
+    candidates: List[Dict[str, Any]] = []
+
+    n = len(df)
+    # start from index position `lookback` to ensure prior context if needed
+    for i in range(lookback, n):
         t = df.index[i]
-        entry_idx = i
-        entry_price = df["close"].iat[entry_idx]
-        atr_t = df["atr"].iat[entry_idx]
-        sl_price = entry_price - k_sl * atr_t if direction == "long" else entry_price + k_sl * atr_t
-        tp_price = entry_price + k_tp * atr_t if direction == "long" else entry_price - k_tp * atr_t
-        end_idx = min(i + max_bars, len(df) - 1)
-        end_time = df.index[end_idx]
-        realized_return = (df["close"].iat[end_idx] - entry_price) / entry_price
-        label = int(realized_return >= (tp_price - entry_price) / entry_price)
-        duration = (end_time - t).total_seconds() / 60
-        dirn = direction
+        entry_price = float(df["close"].iat[i])
+        atr_t = float(df["atr"].iat[i]) if not pd.isna(df["atr"].iat[i]) else 0.0
 
-        # ───────────────────────────────── record building ─────────────────────────
+        # skip if ATR is zero or non-positive (data problem)
+        if atr_t <= 0:
+            continue
+
+        # compute SL/TP based on direction
+        if direction == "long":
+            sl_price = entry_price - k_sl * atr_t
+            tp_price = entry_price + k_tp * atr_t
+        else:
+            sl_price = entry_price + k_sl * atr_t
+            tp_price = entry_price - k_tp * atr_t
+
+        # search forward up to max_bars to find first barrier hit
+        end_idx = min(i + max_bars, n - 1)
+        label = 0
+        hit_idx = end_idx
+        hit_price = float(df["close"].iat[end_idx])
+
+        for j in range(i + 1, end_idx + 1):
+            px_high = float(df["high"].iat[j])
+            px_low = float(df["low"].iat[j])
+            px_close = float(df["close"].iat[j])
+
+            if direction == "long":
+                # if high >= tp_price -> TP hit
+                if px_high >= tp_price:
+                    label = 1
+                    hit_idx = j
+                    # approximate hit price as min(high, tp_price) -> use tp_price for return calc
+                    hit_price = tp_price
+                    break
+                # if low <= sl_price -> SL hit
+                if px_low <= sl_price:
+                    label = 0
+                    hit_idx = j
+                    hit_price = sl_price
+                    break
+            else:
+                if px_low <= tp_price:
+                    label = 1
+                    hit_idx = j
+                    hit_price = tp_price
+                    break
+                if px_high >= sl_price:
+                    label = 0
+                    hit_idx = j
+                    hit_price = sl_price
+                    break
+
+        end_time = df.index[hit_idx]
+        # realized return based on hit_price (or close at vertical if no hit)
+        realized_return = (hit_price - entry_price) / entry_price if direction == "long" else (entry_price - hit_price) / entry_price
+        duration_min = (end_time - t).total_seconds() / 60.0
+
+        # micro-features: prefer existing columns, else default 0.0
+        tick_rate = float(df["tick_rate"].iat[i]) if "tick_rate" in df.columns else 0.0
+        uptick_ratio = float(df["uptick_ratio"].iat[i]) if "uptick_ratio" in df.columns else 0.0
+        buy_vol_ratio = float(df["buy_vol_ratio"].iat[i]) if "buy_vol_ratio" in df.columns else 0.0
+        micro_range = float(df["micro_range"].iat[i]) if "micro_range" in df.columns else 0.0
+        rvol_micro = float(df["rvol"].iat[i]) if "rvol" in df.columns else 0.0
+
         rec = {
             "candidate_time": t,
-            "entry_price": float(entry_price),
-            "atr": float(atr_t),
-            "sl_price": float(sl_price),
-            "tp_price": float(tp_price),
+            "entry_price": entry_price,
+            "atr": atr_t,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
             "end_time": end_time,
             "label": int(label),
-            "duration": float(duration),
+            "duration": float(duration_min),
             "realized_return": float(realized_return),
-            "direction": dirn,
-
-            # --- micro-features (numeric, no NaN) -------------------------------
-            "tick_rate": float(df["tick_rate"].iat[entry_idx]) if "tick_rate" in df.columns else 0.0,
-            "uptick_ratio": float(df["uptick_ratio"].iat[entry_idx]) if "uptick_ratio" in df.columns else 0.0,
-            "buy_vol_ratio": float(df["buy_vol_ratio"].iat[entry_idx]) if "buy_vol_ratio" in df.columns else 0.0,
-            "micro_range": float(df["micro_range"].iat[entry_idx]) if "micro_range" in df.columns else 0.0,
-            "rvol_micro": float(df["rvol"].iat[entry_idx]) if "rvol" in df.columns else 0.0,
+            "direction": direction,
+            # micro-features (numeric, no NaN)
+            "tick_rate": tick_rate,
+            "uptick_ratio": uptick_ratio,
+            "buy_vol_ratio": buy_vol_ratio,
+            "micro_range": micro_range,
+            "rvol_micro": rvol_micro,
         }
 
         candidates.append(rec)
 
     candidates_df = pd.DataFrame(candidates)
 
-    # Logging diagnostics
-    logging.info("Candidate labeling diagnostics")
-    logging.info(f"Total candidates produced: {len(candidates_df)}")
-    logging.info(f"Candidate columns:\n{list(candidates_df.columns)}")
-    if "label" in candidates_df.columns:
-        logging.info(f"label dtype: {candidates_df['label'].dtype}")
-        logging.info(f"label unique values (sample):\n{candidates_df['label'].unique()[:10]}")
-        logging.info(f"label value counts (including NaN):\n{candidates_df['label'].value_counts(dropna=False)}")
-        logging.info(f"label null count: {candidates_df['label'].isna().sum()}")
-    # Check NaNs for key fields
-    key_fields = ["entry_price","atr","sl_price","tp_price"]
-    nan_counts = {k: candidates_df[k].isna().sum() for k in key_fields if k in candidates_df.columns}
-    logging.info(f"NaN counts for important fields:\n{nan_counts}")
+    # Diagnostics logging
+    logger.info("Candidate labeling diagnostics")
+    logger.info("Total candidates produced: %d", len(candidates_df))
+    if not candidates_df.empty:
+        logger.info("Label value counts: %s", candidates_df["label"].value_counts(dropna=False).to_dict())
+        nan_counts = {c: int(candidates_df[c].isna().sum()) for c in ["entry_price", "atr", "sl_price", "tp_price"] if c in candidates_df.columns}
+        logger.info("NaN counts for important fields: %s", nan_counts)
 
     return candidates_df
