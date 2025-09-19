@@ -1,4 +1,4 @@
-# assets.py
+# asset_objects.py
 from dataclasses import dataclass
 from typing import List
 
