@@ -1,11 +1,13 @@
 # features.py
 from __future__ import annotations
+import logging
+from typing import List
+
 import numpy as np
 import pandas as pd
-import logging
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 def _safe_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -15,7 +17,7 @@ def _safe_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     return pd.Series(default, index=df.index, dtype=float)
 
 
-def _safe_series_any(df: pd.DataFrame, cols: list[str], default: float = 0.0) -> pd.Series:
+def _safe_series_any(df: pd.DataFrame, cols: List[str], default: float = 0.0) -> pd.Series:
     """Pick the first existing column in *cols*; else return default series."""
     for c in cols:
         if c in df.columns:
@@ -26,9 +28,12 @@ def _safe_series_any(df: pd.DataFrame, cols: list[str], default: float = 0.0) ->
 def compute_rvol(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     """
     Compute relative volume (rvol) as volume / rolling_median(volume, window).
-    Returns a copy of the input df with 'volume_avg' and 'rvol' columns.
+    Adds 'volume_avg' and 'rvol' to a copy of df.
     """
     out = df.copy()
+    if "volume" not in out.columns:
+        logger.warning("compute_rvol: 'volume' column missing. Adding zeros.")
+        out["volume"] = 0.0
     out["volume_avg"] = out["volume"].rolling(window, min_periods=1).median()
     out["rvol"] = out["volume"] / (out["volume_avg"] + 1e-9)
     out["rvol"] = out["rvol"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -41,10 +46,10 @@ def calculate_health_gauge(
     mom_window: int = 14,
 ) -> pd.DataFrame:
     """
-    Create a daily dataframe with:
-      - health_gauge (0..1)
-      - noncomm_net_chg
-      - comm_net_chg
+    Creates a daily dataframe with:
+        - health_gauge in [0,1]
+        - noncomm_net_chg (raw)
+        - comm_net_chg (raw)
 
     Robust to duplicate/unsorted indexes by normalizing and deduping.
     """
@@ -56,13 +61,13 @@ def calculate_health_gauge(
         price_df.index = pd.to_datetime(price_df.index)
     price_df = price_df.sort_index()
     if price_df.index.duplicated().any():
-        logger.warning("Duplicate indices found in daily_bars — keeping last occurrence per index.")
+        logger.warning("calculate_health_gauge: duplicate indices in daily_bars — keeping last occurrence.")
         price_df = price_df[~price_df.index.duplicated(keep="last")]
 
     # baseline
     gauge = pd.Series(0.35, index=price_df.index, dtype=float)
 
-    # COT processing (40%)
+    # COT block (40%)
     if cot_df is not None and not cot_df.empty:
         cot = cot_df.copy()
         if "report_date" in cot.columns:
@@ -74,10 +79,9 @@ def calculate_health_gauge(
             cot = cot.sort_index()
 
         if cot.index.duplicated().any():
-            logger.warning("Duplicate indices in COT data — keeping last per index.")
+            logger.warning("calculate_health_gauge: duplicate indices in COT — keeping last.")
             cot = cot[~cot.index.duplicated(keep="last")]
 
-        # pick candidate columns robustly
         nc_long = _safe_series_any(cot, ["noncommercial_long", "noncomm_positions_long_all", "noncommercial_long_all"])
         nc_short = _safe_series_any(cot, ["noncommercial_short", "noncomm_positions_short_all", "noncommercial_short_all"])
         c_long = _safe_series_any(cot, ["commercial_long", "comm_positions_long_all", "commercial_long_all"])
@@ -86,11 +90,10 @@ def calculate_health_gauge(
         nc_net = (nc_long - nc_short).fillna(0.0)
         c_net = (c_long - c_short).fillna(0.0)
 
-        # net change (diff)
+        # net change
         nc_net_chg = nc_net.diff().fillna(0.0)
         c_net_chg = c_net.diff().fillna(0.0)
 
-        # normalize by MAD, robust
         def _norm(s: pd.Series) -> pd.Series:
             if s.empty:
                 return pd.Series(0.0, index=price_df.index, dtype=float)
@@ -102,12 +105,10 @@ def calculate_health_gauge(
         nc_norm = _norm(nc_net_chg)
         c_norm = _norm(c_net_chg)
 
-        # align to price index using time interpolation where necessary
         try:
             nc_interp = nc_norm.reindex(price_df.index).interpolate(method="time").fillna(0.0)
             c_interp = c_norm.reindex(price_df.index).interpolate(method="time").fillna(0.0)
         except Exception:
-            # fallback: nearest fill
             nc_interp = nc_norm.reindex(price_df.index).ffill().fillna(0.0)
             c_interp = c_norm.reindex(price_df.index).ffill().fillna(0.0)
 
@@ -117,11 +118,10 @@ def calculate_health_gauge(
         nc_out = nc_net_chg.reindex(price_df.index).fillna(0.0)
         c_out = c_net_chg.reindex(price_df.index).fillna(0.0)
     else:
-        # no cot
         nc_out = pd.Series(0.0, index=price_df.index, dtype=float)
         c_out = pd.Series(0.0, index=price_df.index, dtype=float)
 
-    # momentum / realized vol (25%)
+    # momentum / vol block (25%)
     if "close" not in price_df.columns:
         raise KeyError("daily_bars must contain 'close' for health gauge computation.")
 
@@ -139,16 +139,11 @@ def calculate_health_gauge(
 
     out = pd.DataFrame(
         {
-            "health_gauge": gauge,
-            "noncomm_net_chg": nc_out,
-            "comm_net_chg": c_out,
+            "health_gauge": gauge.astype(float),
+            "noncomm_net_chg": nc_out.astype(float),
+            "comm_net_chg": c_out.astype(float),
         },
         index=price_df.index,
     )
-
-    # ensure dtypes
-    out["health_gauge"] = out["health_gauge"].astype(float)
-    out["noncomm_net_chg"] = out["noncomm_net_chg"].astype(float)
-    out["comm_net_chg"] = out["comm_net_chg"].astype(float)
 
     return out
