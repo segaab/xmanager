@@ -2,6 +2,10 @@
 import os
 from supabase import create_client, Client
 from typing import List, Dict, Optional
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SupabaseLogger:
     def __init__(self):
@@ -14,23 +18,14 @@ class SupabaseLogger:
         if not url or not key:
             raise ValueError("Supabase URL or service key not found in environment variables.")
         self.client: Client = create_client(url, key)
-        # Table names
         self.runs_table = "entry_runs"
         self.trades_table = "entry_trades"
 
     def log_run(self, metrics: Dict, metadata: Dict, trades: Optional[List[Dict]] = None) -> str:
-        """
-        Log a single pipeline run to Supabase.
-        :param metrics: Dict of numeric metrics (accuracy, PnL, win_rate, etc.)
-        :param metadata: Dict of run parameters, thresholds, asset info, etc.
-        :param trades: Optional list of per-trade dictionaries
-        :return: run_id used
-        """
         run_id = metadata.get("run_id")
         if not run_id:
             raise ValueError("metadata must include a 'run_id' field")
 
-        # Prepare run record
         run_record = {
             "run_id": run_id,
             "symbol": metadata.get("symbol"),
@@ -47,39 +42,38 @@ class SupabaseLogger:
             "metrics": metrics,
         }
 
-        # Insert into Supabase
-        response = self.client.table(self.runs_table).insert(run_record).execute()
-        if response.get('error'):
-            raise RuntimeError(f"Failed to insert run: {response['error']}")
+        resp = self.client.table(self.runs_table).insert(run_record).execute()
+        if getattr(resp, "error", None):
+            logger.error("Failed to insert run: %s", resp.error)
+            raise RuntimeError(f"Failed to insert run: {resp.error}")
+        logger.info("Inserted run %s into %s", run_id, self.runs_table)
 
-        # Log trades if provided
         if trades:
+            # make sure we are not inserting objects with non-serializable types
+            sanitized = []
             for t in trades:
-                t['run_id'] = run_id
-            trade_response = self.client.table(self.trades_table).insert(trades).execute()
-            if trade_response.get('error'):
-                raise RuntimeError(f"Failed to insert trades: {trade_response['error']}")
+                t_copy = {k: (str(v) if isinstance(v, (pd.Timestamp, datetime)) else v) for k, v in t.items()}
+                t_copy["run_id"] = run_id
+                sanitized.append(t_copy)
+            tr_resp = self.client.table(self.trades_table).insert(sanitized).execute()
+            if getattr(tr_resp, "error", None):
+                logger.error("Failed to insert trades: %s", tr_resp.error)
+                raise RuntimeError(f"Failed to insert trades: {tr_resp.error}")
+            logger.info("Inserted %d trades for run %s", len(sanitized), run_id)
 
         return run_id
 
     def fetch_runs(self, symbol: Optional[str] = None, limit: int = 50):
-        """
-        Fetch last N runs for an optional symbol filter
-        """
         query = self.client.table(self.runs_table)
         if symbol:
             query = query.eq("symbol", symbol)
-        query = query.order("start_date", desc=True).limit(limit)
-        response = query.execute()
-        if response.get('error'):
-            raise RuntimeError(f"Failed to fetch runs: {response['error']}")
-        return response.get('data', [])
+        resp = query.order("start_date", desc=True).limit(limit).execute()
+        if getattr(resp, "error", None):
+            raise RuntimeError(f"Failed to fetch runs: {resp.error}")
+        return getattr(resp, "data", [])
 
     def fetch_trades(self, run_id: str):
-        """
-        Fetch trades associated with a specific run_id
-        """
-        response = self.client.table(self.trades_table).select("*").eq("run_id", run_id).execute()
-        if response.get('error'):
-            raise RuntimeError(f"Failed to fetch trades: {response['error']}")
-        return response.get('data', [])
+        resp = self.client.table(self.trades_table).select("*").eq("run_id", run_id).execute()
+        if getattr(resp, "error", None):
+            raise RuntimeError(f"Failed to fetch trades: {resp.error}")
+        return getattr(resp, "data", [])
