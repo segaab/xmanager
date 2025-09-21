@@ -1,91 +1,51 @@
 # backtest.py
-import logging
-from typing import Union, Optional
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def simulate_limits(
-    bars: pd.DataFrame,
-    candidates: pd.DataFrame,
-    probs: Union[pd.Series, dict, list, np.ndarray, None] = None,
-    p_fast: float = 0.7,
-    p_slow: float = 0.55,
-    p_deep: float = 0.45,
-) -> pd.DataFrame:
+def backtest_candidates(candidates: pd.DataFrame, initial_capital: float = 10000.0):
     """
-    Simulate fills based on confirm probabilities and candidate realized returns.
-
-    Parameters:
-        bars: pd.DataFrame of price bars (not used directly but for reference if needed)
-        candidates: DataFrame including 'entry_price', optional 'realized_return', 'candidate_time', 'size'
-        probs: pd.Series, dict, list, or np.ndarray aligned to candidates; defaults to 0
-        p_fast, p_slow, p_deep: thresholds for assigning layers
-
-    Returns:
-        pd.DataFrame of simulated trades with columns:
-            candidate_time, layer, entry_price, size, ret, pnl, filled_at
+    Backtest trade candidates and compute stats.
+    Adds open_time / close_time and ensures candidate_time is robust.
     """
-    trades = []
+    if candidates is None or candidates.empty:
+        logger.warning("No candidates provided for backtest.")
+        return pd.DataFrame()
 
-    # Build probability mapping
-    prob_map = {}
-    if probs is None:
-        prob_map = {}
-    elif isinstance(probs, pd.Series):
-        prob_map = probs.to_dict()
-    elif isinstance(probs, dict):
-        prob_map = probs
-    else:
-        try:
-            prob_map = dict(zip(candidates.index, list(probs)))
-        except Exception:
-            logger.warning("Could not align probs array to candidates; defaulting to zeros.")
-            prob_map = {}
+    df = candidates.copy()
 
-    for idx, row in candidates.iterrows():
-        # Use candidate_time if exists, else index
-        candidate_time = row.get("candidate_time", idx)
-        prob = float(prob_map.get(idx, prob_map.get(candidate_time, 0.0)))
+    # Ensure datetime index for candidate_time
+    if "candidate_time" not in df.columns:
+        df["candidate_time"] = df.index
+    df["candidate_time"] = pd.to_datetime(df["candidate_time"], utc=True)
 
-        if prob >= p_fast:
-            layer = "fast"
-        elif prob >= p_slow:
-            layer = "shallow"
-        elif prob >= p_deep:
-            layer = "deep"
-        else:
-            continue  # skip low-prob events
+    # Ensure end_time exists and is timezone-aware
+    if "end_time" not in df.columns:
+        df["end_time"] = df["candidate_time"] + pd.to_timedelta(df.get("duration", 0), unit="m")
+    df["end_time"] = pd.to_datetime(df["end_time"], utc=True)
 
-        # Determine realized return
-        realized_return = row.get("realized_return", None)
-        if realized_return is None or (isinstance(realized_return, float) and np.isnan(realized_return)):
-            # fallback small random return depending on layer
-            mu = 0.001 if layer == "fast" else 0.0005 if layer == "shallow" else 0.0
-            sigma = 0.005
-            ret = float(np.random.normal(loc=mu, scale=sigma))
-        else:
-            ret = float(realized_return)
+    # Open/close times for overlay plots
+    df["open_time"] = df["candidate_time"]
+    df["close_time"] = df["end_time"]
 
-        size = float(row.get("size", 1.0) or 1.0)
-        entry_price = row.get("entry_price", np.nan)
-        entry_price = float(entry_price) if not pd.isna(entry_price) else None
+    # Compute returns and equity
+    df["pnl"] = df["realized_return"] * initial_capital
+    df["equity"] = initial_capital + df["pnl"].cumsum()
 
-        trades.append({
-            "candidate_time": candidate_time,
-            "layer": layer,
-            "entry_price": entry_price,
-            "size": size,
-            "ret": ret,
-            "pnl": size * ret,
-            "filled_at": candidate_time,
-        })
+    # Trade statistics
+    stats = {
+        "total_trades": len(df),
+        "win_trades": int((df["realized_return"] > 0).sum()),
+        "loss_trades": int((df["realized_return"] <= 0).sum()),
+        "win_rate": float((df["realized_return"] > 0).mean()),
+        "avg_return": float(df["realized_return"].mean()),
+        "max_drawdown": float((df["equity"].cummax() - df["equity"]).max()),
+        "final_equity": float(df["equity"].iloc[-1]),
+    }
+    logger.info("Backtest stats: %s", stats)
 
-    if not trades:
-        return pd.DataFrame(columns=["candidate_time", "layer", "entry_price", "size", "ret", "pnl", "filled_at"])
-
-    return pd.DataFrame(trades)
+    return df, stats
