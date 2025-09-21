@@ -1,11 +1,15 @@
 # supabase_logger.py
 import os
-from supabase import create_client, Client
-from typing import List, Dict, Optional
 import logging
+from typing import List, Dict, Optional
+from datetime import datetime
+
+import pandas as pd
+from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class SupabaseLogger:
     def __init__(self):
@@ -22,6 +26,9 @@ class SupabaseLogger:
         self.trades_table = "entry_trades"
 
     def log_run(self, metrics: Dict, metadata: Dict, trades: Optional[List[Dict]] = None) -> str:
+        """
+        Insert a run record into the runs table, optionally log trades linked to the run_id.
+        """
         run_id = metadata.get("run_id")
         if not run_id:
             raise ValueError("metadata must include a 'run_id' field")
@@ -49,12 +56,17 @@ class SupabaseLogger:
         logger.info("Inserted run %s into %s", run_id, self.runs_table)
 
         if trades:
-            # make sure we are not inserting objects with non-serializable types
             sanitized = []
             for t in trades:
-                t_copy = {k: (str(v) if isinstance(v, (pd.Timestamp, datetime)) else v) for k, v in t.items()}
+                t_copy = {}
+                for k, v in t.items():
+                    if isinstance(v, (pd.Timestamp, datetime)):
+                        t_copy[k] = v.isoformat()
+                    else:
+                        t_copy[k] = v
                 t_copy["run_id"] = run_id
                 sanitized.append(t_copy)
+
             tr_resp = self.client.table(self.trades_table).insert(sanitized).execute()
             if getattr(tr_resp, "error", None):
                 logger.error("Failed to insert trades: %s", tr_resp.error)
@@ -64,6 +76,9 @@ class SupabaseLogger:
         return run_id
 
     def fetch_runs(self, symbol: Optional[str] = None, limit: int = 50):
+        """
+        Fetch recent run records, optionally filtered by symbol.
+        """
         query = self.client.table(self.runs_table)
         if symbol:
             query = query.eq("symbol", symbol)
@@ -73,6 +88,9 @@ class SupabaseLogger:
         return getattr(resp, "data", [])
 
     def fetch_trades(self, run_id: str):
+        """
+        Fetch all trades linked to a specific run_id.
+        """
         resp = self.client.table(self.trades_table).select("*").eq("run_id", run_id).execute()
         if getattr(resp, "error", None):
             raise RuntimeError(f"Failed to fetch trades: {resp.error}")
