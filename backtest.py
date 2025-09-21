@@ -1,30 +1,32 @@
 # backtest.py
 """
-Backtesting & sweep utilities for Entry-Range Triangulation demo.
+Backtest utilities: simulate_limits (fills) + summarize_sweep for grid sweeps.
 
-Provides:
- - simulate_limits(...)            : simulate fills based on confirm probabilities + realized returns
- - summarize_sweep(...)            : quick grid-style summary (RR × model_prob_threshold)
- - run_backtest(...)               : lightweight driver to run a grid and return detailed trades
- - run_breadth_backtest(...)       : run Low/Mid/High breadth modes and return aggregate stats
+Functions
+---------
+- simulate_limits(bars, candidates, probs, p_fast, p_slow, p_deep)
+    Simulate fills based on confirm probabilities and candidate realized returns.
 
-Notes / simplifications:
- - This module intentionally keeps interfaces simple and robust for the demo app.
- - It expects `candidates` to contain at least:
-     ['candidate_time','entry_price','atr','realized_return','end_time']
-   and micro-features (optional).
- - `realized_return` is used as the ground-truth filled return for a candidate when available.
- - For sweep/grid operations that change RR, we compute the implied target return:
-     target_ret = (rr * atr) / entry_price
-   and treat a candidate as a "win" for that RR iff realized_return >= target_ret.
- - This is not a full re-labelling engine — it's a lightweight approach that matches the
-   demo app's expectations while remaining fast and deterministic.
+- summarize_sweep(clean, rr_vals, sl_ranges, mpt_list, assume_direction='long')
+    Lightweight grid-sweep summarizer that computes metrics for combinations of
+    RR / SL-range / model-probability-threshold using available candidate fields.
+
+Notes
+-----
+This module is intentionally conservative: it expects the `clean` candidates DataFrame
+to contain (at least) these columns:
+    - candidate_time (datetime-like)
+    - entry_price (float)
+    - atr (float)
+    - realized_return (float)    # return actually observed over candidate horizon
+    - label (0/1)
+Optionally:
+    - pred_prob / pred_proba / confirm_proba (used to filter trades by probability)
+If no probability column exists a default of 0.0 is assumed (you can set it upstream).
 """
-
 from __future__ import annotations
+from typing import Union, Optional, Iterable, Tuple, List, Dict, Any
 import logging
-from typing import Optional, Union, Sequence, Dict, Any, List, Tuple
-
 import numpy as np
 import pandas as pd
 
@@ -32,15 +34,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-# -------------------------------------------------------------------------
-def _ensure_datetime_index(bars: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(bars.index, pd.DatetimeIndex):
-        bars = bars.copy()
-        bars.index = pd.to_datetime(bars.index)
-    return bars
-
-
-# -------------------------------------------------------------------------
 def simulate_limits(
     bars: pd.DataFrame,
     candidates: pd.DataFrame,
@@ -50,36 +43,30 @@ def simulate_limits(
     p_deep: float = 0.45,
 ) -> pd.DataFrame:
     """
-    Simulate fills using candidate realized returns and confirm probabilities.
+    Simulate fills based on confirm probabilities and candidate realized returns.
 
     Parameters
     ----------
     bars : pd.DataFrame
-        Price bars (used primarily for timeline alignment).
+        Price bars (indexed by timestamp). Not required but used for plotting/reference.
     candidates : pd.DataFrame
-        Rows representing candidate events. Must contain 'candidate_time' (or index),
-        'entry_price' and preferably 'realized_return' and 'end_time'.
+        Candidate rows including entry_price, realized_return and candidate_time.
+        Index may be arbitrary; this function will use candidates.index and
+        'candidate_time' field if present.
     probs : pd.Series | dict | list | np.ndarray | None
-        Confirm probabilities aligned to candidates. Accepts multiple shapes:
-        - pd.Series indexed like candidates
-        - dict mapping index or candidate_time -> prob
-        - list/np.array aligned in order with candidates.iterrows()
-        - None => zeros
+        Probabilities aligned to candidates (by index or by candidate_time).
     p_fast, p_slow, p_deep : float
-        Probability thresholds to assign layers. p_fast > p_slow > p_deep.
+        Thresholds for layering.
 
     Returns
     -------
-    trades_df : pd.DataFrame
-        DataFrame of simulated trades with columns:
-          ['candidate_time','open_time','close_time','layer','entry_price',
-           'size','ret','pnl','filled_at','win']
+    pd.DataFrame of trades with columns:
+        candidate_time, layer, entry_price, size, ret, pnl, filled_at
     """
-    bars = _ensure_datetime_index(bars)
     trades: List[Dict[str, Any]] = []
 
-    # Build probability map
-    prob_map: Dict = {}
+    # Build probability mapping
+    prob_map = {}
     if probs is None:
         prob_map = {}
     elif isinstance(probs, pd.Series):
@@ -87,25 +74,17 @@ def simulate_limits(
     elif isinstance(probs, dict):
         prob_map = probs
     else:
-        # list/ndarray -> align by candidates order
         try:
             prob_map = dict(zip(candidates.index, list(probs)))
         except Exception:
             logger.warning("Could not align probs array to candidates; defaulting to zeros.")
             prob_map = {}
 
-    # iterate over candidates (use row index as fallback candidate_time)
     for idx, row in candidates.iterrows():
         candidate_time = row.get("candidate_time", idx)
-        # normalize candidate_time to Timestamp if possible
-        try:
-            candidate_time = pd.to_datetime(candidate_time)
-        except Exception:
-            pass
-
         prob = float(prob_map.get(idx, prob_map.get(candidate_time, 0.0)))
 
-        # assign layer based on prob thresholds
+        # decide whether to attempt fill
         if prob >= p_fast:
             layer = "fast"
         elif prob >= p_slow:
@@ -113,15 +92,11 @@ def simulate_limits(
         elif prob >= p_deep:
             layer = "deep"
         else:
-            # probability too low -> no fill
             continue
 
-        # entry & exit times/prices
-        entry_price = row.get("entry_price", np.nan)
-        # prefer realized_return if provided
+        # realized return if available, else fallback random small return by layer
         realized_return = row.get("realized_return", None)
         if realized_return is None or (isinstance(realized_return, float) and np.isnan(realized_return)):
-            # fallback: use a conservative small random return (to simulate slippage)
             mu = 0.001 if layer == "fast" else 0.0005 if layer == "shallow" else 0.0
             sigma = 0.005
             ret = float(np.random.normal(loc=mu, scale=sigma))
@@ -129,289 +104,158 @@ def simulate_limits(
             ret = float(realized_return)
 
         size = float(row.get("size", 1.0) or 1.0)
-        filled_at = candidate_time
-        open_time = candidate_time
-        close_time = row.get("end_time", candidate_time)
+        entry_price = row.get("entry_price", np.nan)
+        entry_price = float(entry_price) if not pd.isna(entry_price) else None
 
-        # compute pnl
-        pnl = size * ret
-        win = bool(ret > 0)
-
-        trades.append({
-            "candidate_time": candidate_time,
-            "open_time": open_time,
-            "close_time": close_time,
-            "filled_at": filled_at,
-            "layer": layer,
-            "entry_price": float(entry_price) if not pd.isna(entry_price) else None,
-            "size": size,
-            "ret": ret,
-            "pnl": pnl,
-            "win": win,
-        })
+        trades.append(
+            {
+                "candidate_time": candidate_time,
+                "layer": layer,
+                "entry_price": entry_price,
+                "size": size,
+                "ret": ret,
+                "pnl": size * ret,
+                "filled_at": candidate_time,
+            }
+        )
 
     if not trades:
-        # return empty typed dataframe
-        cols = ["candidate_time","open_time","close_time","filled_at","layer","entry_price","size","ret","pnl","win"]
-        return pd.DataFrame(columns=cols)
-
-    trades_df = pd.DataFrame(trades)
-    # ensure proper dtypes
-    trades_df["candidate_time"] = pd.to_datetime(trades_df["candidate_time"])
-    trades_df["open_time"] = pd.to_datetime(trades_df["open_time"])
-    trades_df["close_time"] = pd.to_datetime(trades_df["close_time"])
-    trades_df["filled_at"] = pd.to_datetime(trades_df["filled_at"])
-
-    return trades_df
+        return pd.DataFrame(columns=["candidate_time", "layer", "entry_price", "size", "ret", "pnl", "filled_at"])
+    return pd.DataFrame(trades)
 
 
-# -------------------------------------------------------------------------
-def _compute_target_return_from_rr(row: pd.Series, rr: float) -> float:
-    """
-    Compute the target return for a candidate given RR and candidate fields.
-    target_return = (rr * atr) / entry_price
-    If atr or entry_price missing, return NaN.
-    """
-    atr = row.get("atr", None)
-    entry = row.get("entry_price", None)
-    try:
-        if atr is None or entry is None or entry == 0:
-            return float("nan")
-        return float((rr * float(atr)) / float(entry))
-    except Exception:
-        return float("nan")
+# ---------------------------------------------------------------------
+# Sweep summarizer
+# ---------------------------------------------------------------------
+def _get_prob_series(clean: pd.DataFrame) -> pd.Series:
+    """Pick the best available probability column or return zeros."""
+    for c in ["pred_prob", "pred_proba", "confirm_proba", "proba", "prob"]:
+        if c in clean.columns:
+            return pd.to_numeric(clean[c], errors="coerce").fillna(0.0)
+    return pd.Series(0.0, index=clean.index)
 
 
-# -------------------------------------------------------------------------
 def summarize_sweep(
-    candidates: pd.DataFrame,
-    rr_vals: Sequence[float],
-    sl_ranges: Optional[Sequence[Tuple[float, float]]] = None,
-    mpt_list: Optional[Sequence[float]] = None,
-    include_counts: bool = True,
-) -> pd.DataFrame:
-    """
-    Quick summary for RR × model_prob_threshold grid.
-
-    For each rr and mpt:
-      - treat a candidate as a "win" for rr if realized_return >= target_return (rr × atr / entry)
-      - if mpt_list is provided, interpret it as minimal model probability (but this function
-        does not require a model — it will compute results assuming all candidates pass the prob).
-      - returns aggregated stats.
-
-    This is a fast, approximate sweep used for exploration and UI presentation.
-    """
-    if candidates is None or candidates.empty:
-        return pd.DataFrame()
-
-    rr_vals = list(rr_vals) if rr_vals is not None else [2.0]
-    mpt_list = list(mpt_list) if mpt_list is not None and len(mpt_list) > 0 else [0.0]
-
-    rows: List[Dict[str, Any]] = []
-    for rr in rr_vals:
-        # compute target returns vectorized
-        tr = candidates.apply(lambda r: _compute_target_return_from_rr(r, rr), axis=1)
-        # avoid NaNs by dropping
-        valid_mask = ~tr.isna()
-        if valid_mask.sum() == 0:
-            continue
-        realized = pd.to_numeric(candidates.loc[valid_mask, "realized_return"], errors="coerce").fillna(0.0)
-        # wins per candidate for this rr
-        wins = (realized >= tr.loc[valid_mask]).astype(int)
-
-        for mpt in mpt_list:
-            # In the absence of an actual model, assume all candidates are considered.
-            # The UI will use model thresholds when a model is present. Here we just report
-            # the underlying win rate for the rr selection.
-            total = int(len(wins))
-            wins_count = int(wins.sum())
-            win_rate = float(wins_count / total) if total > 0 else 0.0
-            mean_ret = float(realized.mean()) if total > 0 else 0.0
-            median_ret = float(realized.median()) if total > 0 else 0.0
-            std_ret = float(realized.std(ddof=0)) if total > 1 else 0.0
-
-            rows.append({
-                "rr": float(rr),
-                "model_prob_threshold": float(mpt),
-                "n_candidates": total,
-                "n_wins": wins_count,
-                "win_rate": win_rate,
-                "mean_ret": mean_ret,
-                "median_ret": median_ret,
-                "std_ret": std_ret,
-            })
-
-    return pd.DataFrame(rows)
-
-
-# -------------------------------------------------------------------------
-def run_backtest(
-    bars: pd.DataFrame,
-    candidates: pd.DataFrame,
-    rr_grid: Sequence[float],
-    sl_grid: Optional[Sequence[Tuple[float, float]]] = None,
-    session_modes: Optional[Sequence[str]] = None,
-    model_prob_thresholds: Optional[Sequence[float]] = None,
-    max_bars: int = 60,
-    rvol_threshold: float = 1.5,
-    train_on_allowed_session: bool = True,
-    model_train_kwargs: Optional[Dict[str, Any]] = None,
+    clean: pd.DataFrame,
+    rr_vals: Iterable[float],
+    sl_ranges: Iterable[Tuple[float, float]],
+    mpt_list: Iterable[float],
+    assume_direction: str = "long",
 ) -> Dict[str, Any]:
     """
-    Lightweight driver to run simple grid backtests.
+    Lightweight sweep summary.
 
-    Returns a dict containing:
-      - 'summary': DataFrame-like list of dicts (rr, model_prob_threshold, win_rate, n_trades, mean_ret, ...)
-      - 'detailed_trades': dict keyed by 'rr|mpt' -> trades DataFrame
+    Parameters
+    ----------
+    clean : pd.DataFrame
+        Clean candidate DataFrame (must contain entry_price, atr, realized_return, candidate_time).
+    rr_vals : iterable of floats
+        Risk-Reward multipliers to evaluate.
+    sl_ranges : iterable of (sl_min, sl_max) tuples
+        Stop-loss ranges (expressed in multiples of ATR).
+        Each tuple is interpreted as (sl_min, sl_max); we use the midpoint as representative.
+    mpt_list : iterable of floats
+        Model probability thresholds (i.e., minimum prob to attempt the entry).
 
-    NOTE: This function does not retrain models. It uses the candidates' realized_return to decide wins
-    for different RR values and model probability thresholds. If you want per-grid-model retraining,
-    call your training routine externally per cell and pass its probs into simulate_limits.
+    Returns
+    -------
+    dict with keys:
+        - summary: list of dicts (rr, sl_range, model_prob_threshold, num_trades, win_rate, avg_ret, total_pnl)
+        - detailed_trades: dict mapping 'rr__sl__mpt' -> pd.DataFrame of simulated trades (subset)
     """
-    result = {"summary": [], "detailed_trades": {}}
-    if candidates is None or candidates.empty:
-        logger.warning("run_backtest: no candidates provided")
-        return result
+    if clean is None or clean.empty:
+        return {"summary": [], "detailed_trades": {}}
 
-    rr_grid = list(rr_grid) if rr_grid is not None else [2.0]
-    model_prob_thresholds = list(model_prob_thresholds) if model_prob_thresholds is not None and len(model_prob_thresholds) > 0 else [0.0]
+    # ensure time column
+    if "candidate_time" not in clean.columns:
+        clean = clean.copy()
+        clean["candidate_time"] = pd.to_datetime(clean.index)
 
-    # Precompute a few values
-    candidates = candidates.copy().reset_index(drop=True)
-    candidates["_target_ret_by_rr"] = np.nan  # placeholder
+    probs = _get_prob_series(clean)
 
-    for rr in rr_grid:
-        # compute target return for rr
-        candidates["_target_ret_by_rr"] = candidates.apply(lambda r: _compute_target_return_from_rr(r, rr), axis=1)
-        valid_mask = ~candidates["_target_ret_by_rr"].isna()
-        if valid_mask.sum() == 0:
-            logger.debug("run_backtest: rr=%s produced zero valid candidates", rr)
-            continue
+    summary_rows = []
+    detailed: Dict[str, pd.DataFrame] = {}
 
-        # realized returns (for filtered set)
-        realized = pd.to_numeric(candidates.loc[valid_mask, "realized_return"], errors="coerce").fillna(0.0)
-        target_ret = candidates.loc[valid_mask, "_target_ret_by_rr"]
+    # we require atr and entry_price to compute threshold returns; fall back gracefully
+    atr_arr = pd.to_numeric(clean.get("atr", pd.Series(np.nan, index=clean.index)), errors="coerce").fillna(0.0)
+    entry_arr = pd.to_numeric(clean.get("entry_price", pd.Series(np.nan, index=clean.index)), errors="coerce").fillna(np.nan)
+    realized = pd.to_numeric(clean.get("realized_return", pd.Series(np.nan, index=clean.index)), errors="coerce")
+    direction = assume_direction.lower()
 
-        # for each mpt, compute trades (here mpt acts as post-model filter but we assume all candidates pass)
-        for mpt in model_prob_thresholds:
-            # selection mask: in a full system you'd and with (model_proba >= mpt)
-            sel_mask = valid_mask.copy()
-            sel_idx = candidates.index[sel_mask]
+    for rr in rr_vals:
+        for sl_range in sl_ranges:
+            sl_min, sl_max = float(sl_range[0]), float(sl_range[1])
+            sl_mid = (sl_min + sl_max) / 2.0
 
-            # wins
-            wins = (realized >= target_ret).astype(int)
-            total = int(len(wins))
-            n_wins = int(wins.sum())
-            win_rate = float(n_wins / total) if total > 0 else 0.0
-            mean_ret = float(realized.mean()) if total > 0 else 0.0
-            median_ret = float(realized.median()) if total > 0 else 0.0
-            std_ret = float(realized.std(ddof=0)) if total > 1 else 0.0
+            # compute thresholds in return-space (approx)
+            # rr_return = (rr * atr) / entry_price
+            # sl_return = - (sl_pct * atr) / entry_price
+            rr_return = (rr * atr_arr) / (entry_arr.replace(0, np.nan))
+            sl_return = - (sl_mid * atr_arr) / (entry_arr.replace(0, np.nan))
 
-            key = f"rr{rr}_mpt{mpt}"
-            # Build trivial trades dataframe for this cell (one row per candidate selected)
-            trades_rows = []
-            for idx_sel in sel_idx:
-                r = candidates.loc[idx_sel]
-                ret = float(r.get("realized_return", 0.0))
-                entry_price = r.get("entry_price", None)
-                size = float(r.get("size", 1.0) or 1.0)
-                hit = int(ret >= r.get("_target_ret_by_rr", np.nan)) if not np.isnan(r.get("_target_ret_by_rr", np.nan)) else 0
-                trades_rows.append({
-                    "candidate_time": r.get("candidate_time", pd.NaT),
-                    "entry_price": entry_price,
-                    "size": size,
-                    "ret": ret,
-                    "pnl": size * ret,
-                    "win": bool(hit),
+            # replace inf/nan with large sentinel so conditions are false
+            rr_return = rr_return.replace([np.inf, -np.inf], np.nan).fillna(9e9)
+            sl_return = sl_return.replace([np.inf, -np.inf], np.nan).fillna(-9e9)
+
+            for mpt in mpt_list:
+                # select candidate indices that would be attempted by model threshold
+                mask_attempt = probs >= float(mpt)
+                selected_idx = clean.index[mask_attempt]
+
+                # if none selected, record zeros
+                if len(selected_idx) == 0:
+                    row = {
+                        "rr": float(rr),
+                        "sl_min": float(sl_min),
+                        "sl_max": float(sl_max),
+                        "sl_mid": float(sl_mid),
+                        "model_prob_threshold": float(mpt),
+                        "num_trades": 0,
+                        "win_rate": np.nan,
+                        "avg_ret": np.nan,
+                        "total_pnl": 0.0,
+                    }
+                    summary_rows.append(row)
+                    detailed_key = f"rr{rr}_sl{sl_min}-{sl_max}_mpt{mpt}"
+                    detailed[detailed_key] = pd.DataFrame()
+                    continue
+
+                sel_realized = realized.loc[selected_idx].astype(float)
+                sel_rr_ret = rr_return.loc[selected_idx].astype(float)
+                sel_sl_ret = sl_return.loc[selected_idx].astype(float)
+
+                # Determine wins/losses approximately: if realized_return >= rr_return => win
+                wins_mask = sel_realized >= sel_rr_ret
+                # losses: realized_return <= sl_return
+                losses_mask = sel_realized <= sel_sl_ret
+                # remaining (vertical barrier/no hit) considered losses (conservative)
+                others_mask = ~(wins_mask | losses_mask)
+
+                wins = wins_mask.sum()
+                losses = losses_mask.sum() + others_mask.sum()
+                num = len(selected_idx)
+                win_rate = float(wins) / num if num > 0 else 0.0
+                avg_ret = float(sel_realized.mean())
+                total_pnl = float(sel_realized.sum())
+
+                row = {
                     "rr": float(rr),
+                    "sl_min": float(sl_min),
+                    "sl_max": float(sl_max),
+                    "sl_mid": float(sl_mid),
                     "model_prob_threshold": float(mpt),
-                })
-            trades_df = pd.DataFrame(trades_rows)
-            result["detailed_trades"][key] = trades_df
+                    "num_trades": int(num),
+                    "win_rate": float(win_rate),
+                    "avg_ret": float(avg_ret),
+                    "total_pnl": float(total_pnl),
+                }
+                summary_rows.append(row)
 
-            result["summary"].append({
-                "rr": float(rr),
-                "model_prob_threshold": float(mpt),
-                "n_candidates": total,
-                "n_wins": n_wins,
-                "win_rate": win_rate,
-                "mean_ret": mean_ret,
-                "median_ret": median_ret,
-                "std_ret": std_ret,
-            })
+                # produce a detailed trades frame for this grid cell
+                df_sel = clean.loc[selected_idx].copy()
+                df_sel["_win_rule"] = np.where(wins_mask.loc[selected_idx], "tp", np.where(losses_mask.loc[selected_idx], "sl", "other"))
+                detailed_key = f"rr{rr}_sl{sl_min}-{sl_max}_mpt{mpt}"
+                detailed[detailed_key] = df_sel.reset_index(drop=True)
 
-    # convert summary to DataFrame-like structure for convenience downstream
-    if result["summary"]:
-        result["summary"] = pd.DataFrame(result["summary"])
-    else:
-        result["summary"] = pd.DataFrame()
-
-    return result
-
-
-# -------------------------------------------------------------------------
-def run_breadth_backtest(
-    candidates: pd.DataFrame,
-    rr_vals: Optional[Sequence[float]] = None,
-    sl_ranges: Optional[Sequence[Tuple[float, float]]] = None,
-    session_modes: Optional[Sequence[str]] = None,
-    mpt_list: Optional[Sequence[float]] = None,
-) -> pd.DataFrame:
-    """
-    Run Low / Mid / High breadth modes sequentially and return aggregated stats.
-
-    Breadth modes (simple, rule-based):
-      - Low Breadth:  prefer conservative rr in rr_vals (e.g., lower RR),
-      - Mid Breadth:  choose medium RR,
-      - High Breadth: prefer higher RR values (exploratory).
-
-    The function returns a DataFrame with one row per breadth mode with stats:
-      [mode, rr_used, n_candidates, n_wins, win_rate, mean_ret, median_ret, std_ret]
-
-    Note: this is a rule-driven orchestration function for UI; it's not a full optimization engine.
-    """
-    if candidates is None or candidates.empty:
-        return pd.DataFrame()
-
-    rr_vals = sorted(list(rr_vals) if rr_vals is not None else [2.0])
-    mpt_list = list(mpt_list) if mpt_list is not None and len(mpt_list) > 0 else [0.0]
-
-    def _aggregate_for_rr(rr: float) -> Dict[str, Any]:
-        tr = candidates.apply(lambda r: _compute_target_return_from_rr(r, rr), axis=1)
-        valid_mask = ~tr.isna()
-        if valid_mask.sum() == 0:
-            return {"n_candidates": 0, "n_wins": 0, "win_rate": 0.0, "mean_ret": 0.0, "median_ret": 0.0, "std_ret": 0.0}
-        realized = pd.to_numeric(candidates.loc[valid_mask, "realized_return"], errors="coerce").fillna(0.0)
-        target_ret = tr.loc[valid_mask]
-        wins = (realized >= target_ret).astype(int)
-        total = int(len(wins))
-        n_wins = int(wins.sum())
-        win_rate = float(n_wins / total) if total > 0 else 0.0
-        return {
-            "n_candidates": total,
-            "n_wins": n_wins,
-            "win_rate": win_rate,
-            "mean_ret": float(realized.mean()) if total > 0 else 0.0,
-            "median_ret": float(realized.median()) if total > 0 else 0.0,
-            "std_ret": float(realized.std(ddof=0)) if total > 1 else 0.0,
-        }
-
-    results: List[Dict[str, Any]] = []
-    # Determine candidate counts per RR and pick RR for each breadth mode
-    if len(rr_vals) == 1:
-        low_rr = mid_rr = high_rr = rr_vals[0]
-    else:
-        low_rr = rr_vals[0]
-        mid_rr = rr_vals[len(rr_vals) // 2]
-        high_rr = rr_vals[-1]
-
-    for mode, rr_choice in [("Low", low_rr), ("Mid", mid_rr), ("High", high_rr)]:
-        stats = _aggregate_for_rr(rr_choice)
-        row = {
-            "mode": mode,
-            "rr_used": float(rr_choice),
-            **stats
-        }
-        results.append(row)
-
-    return pd.DataFrame(results)
+    summary_df = pd.DataFrame(summary_rows)
+    return {"summary": summary_df, "detailed_trades": detailed}
