@@ -11,7 +11,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import io
 import uuid
-import hashlib
 import json
 import torch
 from datetime import date, timedelta, datetime
@@ -35,7 +34,7 @@ st.set_page_config(layout="wide", page_title="Entry Triangulation Demo")
 st.title("Entry-Range Triangulation Demo (HealthGauge → Entry → Confirm)")
 
 # ---------------------------
-# Sidebar controls (preserve existing + new options)
+# Sidebar controls
 # ---------------------------
 with st.sidebar:
     st.header("Data / Run Controls")
@@ -129,37 +128,28 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
     meta_file = f"{model_basename}_{ts}.json"
     fi_file = f"{model_basename}_{ts}_feature_importance.json"
 
-    # if wrapper exposes booster
     try:
         booster = getattr(model_wrapper, "booster", None)
         if booster is None:
-            # try attribute name 'booster' in some wrappers
             booster = getattr(model_wrapper, "model", None)
         if booster is None:
-            # last resort: pickle wrapper
             torch.save({'model_wrapper': model_wrapper, 'features': feature_list, 'metrics': metrics}, f"{model_basename}_{ts}.pt")
             paths['pt'] = f"{model_basename}_{ts}.pt"
-            # metadata only
             with open(meta_file, "w") as f:
                 json.dump({"features": feature_list, "metrics": metrics, "saved_at": ts}, f, indent=2)
             paths['meta'] = meta_file
             return paths
-        # save booster in xgb native format
+
         booster.save_model(model_file)
         paths['model'] = model_file
 
-        # feature importance
         fi = {}
         try:
-            # get_score returns dict of feature->gain
             fi_raw = booster.get_score(importance_type="gain")
-            # map to all features (zero if missing)
             fi = {f: float(fi_raw.get(f, 0.0)) for f in feature_list}
         except Exception:
-            # fallback empty
             fi = {f: 0.0 for f in feature_list}
 
-        # metadata
         meta = {"features": feature_list, "metrics": metrics, "saved_at": ts}
         with open(meta_file, "w") as f:
             json.dump(meta, f, indent=2)
@@ -171,7 +161,6 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
             paths['feature_importance'] = fi_file
 
     except Exception as exc:
-        # fallback single-file torch save
         torch.save({'model_wrapper': model_wrapper, 'features': feature_list, 'metrics': metrics}, f"{model_basename}_{ts}.pt")
         paths['pt'] = f"{model_basename}_{ts}.pt"
         with open(meta_file, "w") as f:
@@ -179,8 +168,6 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
         paths['meta'] = meta_file
 
     return paths
-
-# app.py (part 2/2) — continuation: main pipeline + reporting overlays & exports
 
 # ---------------------------
 # Main pipeline
@@ -206,7 +193,6 @@ if run:
         st.warning(f"COT fetch failed: {e}. Continuing with empty COT.")
         cot = pd.DataFrame()
 
-    # Build daily bars and ensure no duplicate index entries
     daily_bars = bars.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
     daily_bars = daily_bars.loc[~daily_bars.index.duplicated(keep="first")]
 
@@ -250,25 +236,21 @@ if run:
         st.stop()
     st.dataframe(candidates.head())
 
-    # Optionally merge HealthGauge into candidate features
+    # Merge HealthGauge if selected
     if include_health_as_feature:
         candidates = candidates.copy()
         candidates['candidate_date'] = pd.to_datetime(candidates['candidate_time']).dt.normalize()
-        # align daily health gauge (index is daily_bars index)
         hg = health_df[['health_gauge']].copy()
         hg = hg.reindex(pd.to_datetime(hg.index).normalize()).reset_index().rename(columns={'index':'candidate_date'})
-        # merge
         candidates = candidates.merge(hg, on='candidate_date', how='left')
         candidates['health_gauge'] = candidates['health_gauge'].fillna(method='ffill').fillna(0.0)
-        # remove helper column
         candidates.drop(columns=['candidate_date'], inplace=True)
 
     st.info("Training XGBoost confirm model…")
     feat_cols = ['tick_rate','uptick_ratio','buy_vol_ratio','micro_range','rvol_micro']
     if include_health_as_feature:
-        feat_cols = feat_cols + ['health_gauge']
+        feat_cols.append('health_gauge')
 
-    # ensure features present (fill zeros where missing)
     for col in feat_cols + ["label"]:
         if col not in candidates.columns:
             candidates[col] = np.nan
@@ -299,182 +281,75 @@ if run:
     st.write("Training metrics (summary):")
     st.write(metrics)
 
-    st.info("Predicting confirm probabilities and running backtest…")
+st.info("Predicting confirm probabilities on candidate events…")
     try:
-        probs = predict_confirm_prob(model, clean, feature_list)
+        clean['pred_prob'] = predict_confirm_prob(model, clean[feat_cols])
+        clean['pred_label'] = (clean['pred_prob'] >= p_fast).astype(int)
     except Exception as e:
         st.error(f"Prediction failed: {e}")
         st.stop()
 
-    trades = simulate_limits(bars, clean, probs, p_fast=p_fast, p_slow=p_slow, p_deep=p_deep)
-    st.write("Simulated trades:", len(trades))
+    if show_confusion:
+        cm = confusion_matrix(clean['label'], clean['pred_label'])
+        report = classification_report(clean['label'], clean['pred_label'], output_dict=True)
+        st.subheader("Confusion Matrix")
+        st.write(cm)
+        st.subheader("Classification Report (summary)")
+        st.json(report)
 
-    # Show overlay of entries on price chart (entry markers + win/loss color)
-    if overlay_entries_on_price and not trades.empty:
-        plt_close = bars['close']
-        fig, ax = plt.subplots(figsize=(12, 4))
-        plt_close.plot(ax=ax, label='close')
-        # only plot trades that are inside the price timeframe
-        trades_plot = trades.copy()
-        trades_plot['candidate_time'] = pd.to_datetime(trades_plot['candidate_time'])
-        trades_plot = trades_plot[trades_plot['candidate_time'].isin(bars.index)]
-        for _, r in trades_plot.iterrows():
-            t = r['candidate_time']
-            entry_price = r.get('entry_price', None)
-            color = 'g' if r.get('ret', 0) > 0 else 'r'
-            ax.axvline(x=t, color=color, alpha=0.6, linewidth=0.8)
-            if entry_price is not None:
-                ax.plot(t, entry_price, marker='o', color=color)
-        ax.set_title(f"{symbol} — Price with entry overlays (green win / red loss)")
+    if overlay_entries_on_price:
+        st.subheader("Overlay of predicted entries on price")
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(bars.index, bars['close'], label='Close', color='blue')
+        buy_mask = clean['pred_label'] == 1
+        sell_mask = clean['pred_label'] == 0
+        ax.scatter(clean['candidate_time'][buy_mask], clean['close'][buy_mask], color='green', marker='^', label='Pred Buy')
+        ax.scatter(clean['candidate_time'][sell_mask], clean['close'][sell_mask], color='red', marker='v', label='Pred Sell')
+        ax.set_title(f"{selected_asset} Predicted Entries Overlay")
         ax.legend()
         st.pyplot(fig)
 
-    if not trades.empty:
-        trades['ret'] = pd.to_numeric(trades.get('ret', 0.0), errors='coerce').fillna(0.0)
-        trades['size'] = pd.to_numeric(trades.get('size', 0.0), errors='coerce').fillna(0.0)
-        trades['pnl'] = trades['size'] * trades['ret']
+    st.info("Exporting model + metadata…")
+    model_paths = export_model_and_metadata(model, feature_list, metrics, model_basename=f"{selected_asset}_confirm", save_fi=save_feature_importance)
+    st.write("Saved model files:")
+    st.json(model_paths)
 
-        num_trades = len(trades)
-        total_pnl = trades['pnl'].sum()
-        avg_ret = trades['ret'].mean()
-        median_ret = trades['ret'].median()
-        std_ret = trades['ret'].std(ddof=0) if num_trades > 1 else 0.0
-        win_rate = (trades['ret'] > 0).sum() / num_trades
-
-        st.metric("Num trades (simulated)", f"{num_trades}")
-        st.metric("Total PnL (simulated)", f"{total_pnl:.6f}")
-        st.metric("Average return / filled trade", f"{avg_ret:.6f}")
-        st.metric("Win rate", f"{win_rate:.2%}")
-
-        st.dataframe(trades.head())
-
-        pnl_series = trades.groupby('candidate_time')['pnl'].sum().cumsum()
-        fig2, ax2 = plt.subplots()
-        pnl_series.plot(ax=ax2)
-        ax2.set_title("Cumulative PnL (simulated)")
-        st.pyplot(fig2)
-    else:
-        st.warning("No trades simulated.")
-        num_trades = 0; total_pnl = 0.0; avg_ret = 0.0; win_rate = 0.0
-
-    # Confusion matrix & classification report (on same dataset used for training/predict)
-    if show_confusion:
-        try:
-            y_true = clean['label'].values
-            y_proba_all = predict_confirm_prob(model, clean, feature_list).values
-            y_pred = (y_proba_all >= 0.5).astype(int)
-            cm = confusion_matrix(y_true, y_pred)
-            cr = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
-            st.subheader("Confusion matrix (threshold=0.5)")
-            st.write(pd.DataFrame(cm, index=['true_0','true_1'], columns=['pred_0','pred_1']))
-            st.subheader("Classification report")
-            st.write(pd.DataFrame(cr).transpose())
-        except Exception as exc:
-            st.warning(f"Could not compute confusion/classification report: {exc}")
-
-    st.success("Demo complete.")
-
-    # ---------------------------
-    # Save final model: retrain on FULL candidate universe (ignore HealthGauge gating)
-    # Save both xgboost native model file + metadata JSON + feature importance JSON when asked
-    # ---------------------------
-    st.subheader("Save Model (train on full candidate universe)")
-    model_name_input = st.text_input("Enter model name", value=f"confirm_model_{symbol.replace('=','_')}")
-    if st.button("Save model as .model + metadata"):
-        try:
-            # regenerate full candidate set ignoring health gating (use bars_rvol)
-            full_candidates = generate_candidates_and_labels(
-                df=bars_rvol,
-                lookback=64,
-                k_tp=2.0,
-                k_sl=1.0,
-                atr_window=asset_obj.atr_lookback,
-                max_bars=max_bars
-            )
-            if full_candidates is None or full_candidates.empty:
-                st.error("Full candidate generation returned empty — cannot train final model.")
-            else:
-                # optionally merge HealthGauge into full candidates if selected
-                if include_health_as_feature:
-                    full_candidates = full_candidates.copy()
-                    full_candidates['candidate_date'] = pd.to_datetime(full_candidates['candidate_time']).dt.normalize()
-                    hg = health_df[['health_gauge']].copy()
-                    hg = hg.reindex(pd.to_datetime(hg.index).normalize()).reset_index().rename(columns={'index':'candidate_date'})
-                    full_candidates = full_candidates.merge(hg, on='candidate_date', how='left')
-                    full_candidates['health_gauge'] = full_candidates['health_gauge'].fillna(method='ffill').fillna(0.0)
-                    full_candidates.drop(columns=['candidate_date'], inplace=True)
-
-                for col in feat_cols + ["label"]:
-                    if col not in full_candidates.columns:
-                        full_candidates[col] = np.nan
-                for col in feat_cols:
-                    full_candidates[col] = pd.to_numeric(full_candidates[col], errors="coerce").fillna(0)
-
-                full_clean = full_candidates.dropna(subset=["label"])
-                full_clean = full_clean[full_clean["label"].isin([0, 1])]
-                if full_clean.empty:
-                    st.error("No valid labeled data in full candidate set.")
-                else:
-                    final_model, final_featlist, final_metrics = train_xgb_confirm(
-                        clean=full_clean,
-                        feature_cols=feat_cols,
-                        label_col="label",
-                        num_boost_round=int(num_boost),
-                        early_stopping_rounds=int(early_stop),
-                        test_size=float(test_size),
-                        random_state=42,
-                        verbose=False,
-                    )
-                    # export model + metadata + fi
-                    saved_paths = export_model_and_metadata(final_model, final_featlist, final_metrics, model_name_input, save_fi=save_feature_importance)
-                    st.success(f"Saved final model. Files: {saved_paths}")
-        except Exception as e:
-            st.error(f"Failed to train/save final model: {e}")
-
-    # Supabase logging (preserve)
-    st.subheader("Logging")
-    if st.button("Save logs to Supabase"):
-        run_id = str(uuid.uuid4())
-        metadata = {
-            "run_id": run_id,
+    # Optional: Supabase logging
+    try:
+        logger = SupabaseLogger()
+        log_entry = {
+            "asset": selected_asset,
             "symbol": symbol,
-            "start_date": str(start_date),
-            "end_date": str(end_date),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
             "interval": interval,
-            "feature_cols": feat_cols,
-            "model_file": None,
-            "training_params": {"num_boost_round": int(num_boost), "early_stopping_rounds": int(early_stop), "test_size": float(test_size)},
-            "health_thresholds": {"buy_threshold": float(buy_threshold), "sell_threshold": float(sell_threshold)},
-            "p_fast": float(p_fast), "p_slow": float(p_slow), "p_deep": float(p_deep),
+            "num_candidates": len(clean),
+            "health_latest": latest_health,
+            "metrics": metrics,
+            "saved_paths": model_paths
         }
-        backtest_metrics = {
-            "num_trades": int(num_trades) if num_trades else 0,
-            "total_pnl": float(total_pnl) if num_trades else 0.0,
-            "avg_ret": float(avg_ret) if num_trades else 0.0,
-            "median_ret": float(median_ret) if num_trades else 0.0,
-            "std_ret": float(std_ret) if num_trades else 0.0,
-            "win_rate": float(win_rate),
-            "latest_health": float(latest_health),
-        }
-        combined_metrics = {}
-        combined_metrics.update(backtest_metrics)
+        logger.log_pipeline_run(log_entry)
+        st.success("Pipeline run logged to Supabase.")
+    except Exception as e:
+        st.warning(f"Supabase logging skipped: {e}")
 
-        trade_list = []
-        if not trades.empty:
-            for r in trades.to_dict(orient="records"):
-                trade_list.append({
-                    "candidate_time": str(r.get("candidate_time")),
-                    "layer": r.get("layer", None),
-                    "size": float(r.get("size") or 0.0),
-                    "entry_price": float(r.get("entry_price") or 0.0),
-                    "filled_at": str(r.get("filled_at")) if r.get("filled_at") is not None else None,
-                    "ret": float(r.get("ret") or 0.0),
-                    "pnl": float(r.get("pnl") or 0.0),
-                })
+    st.success("Pipeline run completed!")
 
-        try:
-            supa = SupabaseLogger()
-            run_id_returned = supa.log_run(metrics=combined_metrics, metadata=metadata, trades=trade_list)
-            st.success(f"Logged run to Supabase with run_id: {run_id_returned}")
-        except Exception as e:
-            st.error(f"Failed to log to Supabase: {e}")
+# ---------------------------
+# Breadth / Grid Sweep modes
+# ---------------------------
+if run_breadth:
+    st.info("Running breadth backtest modes…")
+    try:
+        breadth_results = run_breadth_backtest(clean, rr_vals=rr_vals, sl_ranges=sl_ranges, session_modes=session_modes, mpt_list=mpt_list)
+        st.dataframe(breadth_results)
+    except Exception as e:
+        st.error(f"Breadth backtest failed: {e}")
+
+if run_sweep_btn:
+    st.info("Running grid sweep simulations…")
+    try:
+        sweep_summary = summarize_sweep(clean, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list)
+        st.dataframe(sweep_summary)
+    except Exception as e:
+        st.error(f"Grid sweep failed: {e}")
