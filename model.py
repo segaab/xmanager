@@ -50,7 +50,7 @@ def train_xgb_confirm(
     test_size: float = 0.2,
     random_state: int = 42,
     verbose: bool = False,
-    num_boost_round: int = 200,
+    num_boost_round: Optional[int] = 200,
     early_stopping_rounds: Optional[int] = None,
 ) -> Tuple[Any, List[str], Dict[str, Any]]:
     """
@@ -111,7 +111,7 @@ def train_xgb_confirm(
         bst = xgb.train(
             params,
             dtrain,
-            num_boost_round=int(num_boost_round),
+            num_boost_round=int(num_boost_round) if num_boost_round is not None else 200,
             evals=evals,
             early_stopping_rounds=int(early_stopping_rounds) if early_stopping_rounds and int(early_stopping_rounds) > 0 else None,
             verbose_eval=verbose,
@@ -121,7 +121,7 @@ def train_xgb_confirm(
         bst = xgb.train(
             params,
             dtrain,
-            num_boost_round=int(num_boost_round),
+            num_boost_round=int(num_boost_round) if num_boost_round is not None else 200,
             evals=evals,
             verbose_eval=verbose,
         )
