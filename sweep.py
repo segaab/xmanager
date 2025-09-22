@@ -1,126 +1,53 @@
-# sweep.py
-"""
-Sweep evaluation utilities for candidate signals.
-
-Provides functions to evaluate a grid of risk-reward / stop-loss / model probability thresholds
-and compute summary statistics and detailed trade DataFrames.
-
-Intended to be used for:
-    - grid sweeps
-    - parameter optimization
-    - pre-backtest filtering
-
-Dependencies
-------------
-- pandas, numpy, logging
-- backtest.py functions (simulate_limits, summarize_sweep)
-"""
-
-from typing import Iterable, Tuple, List, Dict, Any, Optional
+# sweep.py — Sweep Mode with Logging
 import pandas as pd
-import numpy as np
 import logging
 from backtest import simulate_limits
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-
-def sweep_candidates(
-    candidates: pd.DataFrame,
-    rr_vals: Iterable[float],
-    sl_ranges: Iterable[Tuple[float, float]],
-    mpt_list: Iterable[float],
-    assume_direction: str = "long",
-) -> Dict[str, Any]:
+def run_sweep(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = "GC=F"):
     """
-    Evaluate a sweep grid for candidate entries.
-
-    Parameters
-    ----------
-    candidates : pd.DataFrame
-        Candidate signals. Must include:
-            - candidate_time (datetime)
-            - entry_price (float)
-            - atr (float)
-            - realized_return (float)
-            - optional: pred_prob / confirm_proba
-    rr_vals : iterable of float
-        Risk-Reward multipliers
-    sl_ranges : iterable of (float, float)
-        Stop-loss ranges (expressed in ATR multiples)
-    mpt_list : iterable of float
-        Minimum probability thresholds for model confirmation
-    assume_direction : str
-        "long" or "short" (used for interpreting return thresholds)
-
-    Returns
-    -------
-    dict with:
-        - summary : pd.DataFrame summarizing grid results
-        - detailed_trades : dict mapping grid-cell keys -> DataFrames
+    Run sweeps across multiple parameter configurations.
+    clean : DataFrame with features + labels + predictions
+    bars  : Price dataframe (OHLCV)
     """
-    if candidates is None or candidates.empty:
-        return {"summary": pd.DataFrame(), "detailed_trades": {}}
+    results = {}
+    logger.info("Starting sweep mode backtest…")
 
-    # run simulate_limits optionally if needed for fills
-    # currently we assume realized_return is available
-    # candidates_filled = simulate_limits(candidates)
+    if clean is None or clean.empty:
+        logger.error("Clean dataset is empty, cannot run sweep.")
+        return results
 
-    # compute summary per grid cell
-    from backtest import summarize_sweep
+    # Sweep parameters
+    sell_thresholds = [3, 4, 5]
+    buy_thresholds = [5, 6, 7]
 
-    sweep_res = summarize_sweep(
-        clean=candidates,
-        rr_vals=rr_vals,
-        sl_ranges=sl_ranges,
-        mpt_list=mpt_list,
-        assume_direction=assume_direction,
-    )
-    return sweep_res
+    for s in sell_thresholds:
+        for b in buy_thresholds:
+            key = f"sell{s}_buy{b}"
+            logger.info("Sweep iteration %s: sell<%d, buy>%d", key, s, b)
+            try:
+                df = clean.copy()
+                df["pred_label"] = 0
+                df.loc[df["signal"] > b, "pred_label"] = 1
+                df.loc[df["signal"] < s, "pred_label"] = -1
 
+                overlay = simulate_limits(df, bars, label_col="pred_label", symbol=symbol)
+                results[key] = {
+                    "trades": overlay.shape[0] if overlay is not None else 0,
+                    "overlay": overlay,
+                }
+                logger.info("Sweep %s completed: %d trades simulated.", key, results[key]["trades"])
+            except Exception as e:
+                logger.error("Sweep %s failed: %s", key, e, exc_info=True)
+                results[key] = {"error": str(e)}
 
-def best_grid_cell(summary: pd.DataFrame, metric: str = "total_pnl", top_n: int = 1) -> pd.DataFrame:
-    """
-    Select the best performing grid cells according to a metric.
+    logger.info("Sweep backtest finished with %d iterations.", len(results))
+    return results
 
-    Parameters
-    ----------
-    summary : pd.DataFrame
-        Output from sweep_candidates()["summary"]
-    metric : str
-        Column name to sort by (e.g., "total_pnl", "avg_ret", "win_rate")
-    top_n : int
-        Number of top-performing cells to return
-
-    Returns
-    -------
-    pd.DataFrame subset of summary with top_n rows
-    """
-    if summary is None or summary.empty or metric not in summary.columns:
-        return pd.DataFrame()
-    return summary.sort_values(by=metric, ascending=False).head(top_n).reset_index(drop=True)
-
-
-def filter_candidates_by_prob(
-    candidates: pd.DataFrame, min_prob: float = 0.5, prob_col: str = "pred_prob"
-) -> pd.DataFrame:
-    """
-    Filter candidate signals by minimum probability.
-
-    Parameters
-    ----------
-    candidates : pd.DataFrame
-    min_prob : float
-        Minimum probability threshold
-    prob_col : str
-        Column containing model probability
-
-    Returns
-    -------
-    pd.DataFrame
-        Subset of candidates exceeding min_prob
-    """
-    if candidates is None or candidates.empty or prob_col not in candidates.columns:
-        return candidates
-    return candidates[candidates[prob_col].astype(float) >= min_prob].copy()
+# CLI entry
+if __name__ == "__main__":
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    logger.addHandler(handler)
+    print("Run via app.py or import run_sweep")
