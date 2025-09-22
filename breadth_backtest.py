@@ -19,7 +19,7 @@ def run_breadth_backtest(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = 
         logger.error("Clean dataset is empty, cannot run backtest.")
         return results
 
-    # Modes
+    # Modes and thresholds (these are examples; you can parameterize further)
     modes = {
         "low_breadth": {"sell_th": 5, "buy_th": 5},
         "mid_breadth": {"sell_th": 4, "buy_th": 6},
@@ -30,6 +30,11 @@ def run_breadth_backtest(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = 
         logger.info("Running %s with thresholds: sell<%s, buy>%s", mode, th["sell_th"], th["buy_th"])
         try:
             df = clean.copy()
+            # ensure 'signal' exists
+            if "signal" not in df.columns:
+                logger.warning("No 'signal' column found in clean; using 'pred_prob' scaled to 0-10")
+                df["signal"] = (df.get("pred_prob", 0.0) * 10).round().astype(int)
+
             df["pred_label"] = 0
             df.loc[df["signal"] > th["buy_th"], "pred_label"] = 1
             df.loc[df["signal"] < th["sell_th"], "pred_label"] = -1
@@ -46,10 +51,3 @@ def run_breadth_backtest(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = 
 
     logger.info("Breadth backtest finished with modes: %s", list(results.keys()))
     return results
-
-# CLI entry
-if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    logger.addHandler(handler)
-    print("Run via app.py or import run_breadth_backtest")
