@@ -55,16 +55,24 @@ def simulate_limits(
 
     trades = []
     for idx, row in df.iterrows():
-        if row.get(label_col, 0) == 0:
+        # treat non-positive labels as "no trade" unless explicitly 1 or -1
+        lbl = row.get(label_col, 0)
+        if lbl == 0 or pd.isna(lbl):
             continue
 
-        entry_time = row.get("time") or row.name
+        entry_time = row.get("candidate_time") or row.get("entry_time") or row.name
+        # normalize entry_time to index value if it's a Timestamp string
+        try:
+            entry_time = pd.to_datetime(entry_time)
+        except Exception:
+            pass
+
         if entry_time not in bars.index:
             logger.debug("Entry time %s not found in bars index — skipping.", entry_time)
             continue
 
-        entry_price = bars.loc[entry_time, "close"]
-        direction = int(row[label_col])
+        entry_price = float(bars.loc[entry_time, "close"])
+        direction = int(np.sign(lbl))  # 1 or -1
 
         # Set stop-loss and take-profit levels
         sl_price = entry_price * (1 - sl) if direction > 0 else entry_price * (1 + sl)
@@ -74,25 +82,30 @@ def simulate_limits(
         holding_bars = bars.loc[entry_time:].head(max_holding)
 
         for t, b in holding_bars.iterrows():
+            low = float(b.get("low", np.nan))
+            high = float(b.get("high", np.nan))
             if direction > 0:
-                if b["low"] <= sl_price:  # stop hit
+                if low <= sl_price:
                     exit_time, exit_price, pnl = t, sl_price, -sl
                     break
-                if b["high"] >= tp_price:  # tp hit
+                if high >= tp_price:
                     exit_time, exit_price, pnl = t, tp_price, tp
                     break
             else:
-                if b["high"] >= sl_price:  # stop hit
+                if high >= sl_price:
                     exit_time, exit_price, pnl = t, sl_price, -sl
                     break
-                if b["low"] <= tp_price:  # tp hit
+                if low <= tp_price:
                     exit_time, exit_price, pnl = t, tp_price, tp
                     break
 
-        if exit_time is None:
+        if exit_time is None and not holding_bars.empty:
             exit_time = holding_bars.index[-1]
-            exit_price = holding_bars.iloc[-1]["close"]
+            exit_price = float(holding_bars.iloc[-1].get("close", entry_price))
             pnl = (exit_price - entry_price) / entry_price * direction
+
+        if pnl is None:
+            continue
 
         trades.append({
             "symbol": symbol,
@@ -101,7 +114,7 @@ def simulate_limits(
             "direction": direction,
             "exit_time": exit_time,
             "exit_price": exit_price,
-            "pnl": pnl
+            "pnl": float(pnl)
         })
 
     overlay = pd.DataFrame(trades)
@@ -113,11 +126,3 @@ def simulate_limits(
                     len(overlay), overlay["pnl"].mean())
 
     return overlay
-
-
-# CLI entry
-if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    logger.addHandler(handler)
-    print("Run via app.py or import simulate_limits")
