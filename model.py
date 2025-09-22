@@ -185,3 +185,59 @@ def predict_confirm_prob(model: Any, candidates: pd.DataFrame, feature_cols: Lis
         proba = pd.Series(np.zeros(len(X), dtype=float), index=candidates.index, name="confirm_proba")
 
     return proba
+
+
+def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: Dict[str, Any], model_basename: str, save_fi: bool = True):
+    """
+    Save xgboost booster to .model (xgb native) + JSON metadata incl feature importance.
+    Returns paths saved.
+    """
+    import json
+    import torch
+    from datetime import datetime
+    paths = {}
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    model_file = f"{model_basename}_{ts}.model"
+    meta_file = f"{model_basename}_{ts}.json"
+    fi_file = f"{model_basename}_{ts}_feature_importance.json"
+
+    try:
+        booster = getattr(model_wrapper, "booster", None)
+        if booster is None:
+            booster = getattr(model_wrapper, "model", None)
+        if booster is None:
+            torch.save({'model_wrapper': model_wrapper, 'features': feature_list, 'metrics': metrics}, f"{model_basename}_{ts}.pt")
+            paths['pt'] = f"{model_basename}_{ts}.pt"
+            with open(meta_file, "w") as f:
+                json.dump({"features": feature_list, "metrics": metrics, "saved_at": ts}, f, indent=2)
+            paths['meta'] = meta_file
+            return paths
+
+        booster.save_model(model_file)
+        paths['model'] = model_file
+
+        fi = {}
+        try:
+            fi_raw = booster.get_score(importance_type="gain")
+            fi = {f: float(fi_raw.get(f, 0.0)) for f in feature_list}
+        except Exception:
+            fi = {f: 0.0 for f in feature_list}
+
+        meta = {"features": feature_list, "metrics": metrics, "saved_at": ts}
+        with open(meta_file, "w") as f:
+            json.dump(meta, f, indent=2)
+        paths['meta'] = meta_file
+
+        if save_fi:
+            with open(fi_file, "w") as f:
+                json.dump(fi, f, indent=2)
+            paths['feature_importance'] = fi_file
+
+    except Exception:
+        torch.save({'model_wrapper': model_wrapper, 'features': feature_list, 'metrics': metrics}, f"{model_basename}_{ts}.pt")
+        paths['pt'] = f"{model_basename}_{ts}.pt"
+        with open(meta_file, "w") as f:
+            json.dump({"features": feature_list, "metrics": metrics, "saved_at": ts}, f, indent=2)
+        paths['meta'] = meta_file
+
+    return paths
