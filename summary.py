@@ -84,11 +84,3 @@ def combine_summaries(results: dict) -> pd.DataFrame:
     logger.info("combine_summaries finished with %d rows", len(combined_df))
 
     return combined_df
-
-
-# CLI entry
-if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    logger.addHandler(handler)
-    print("Run via app.py or import summarize_trades/combine_summaries")
