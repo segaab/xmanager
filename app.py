@@ -86,6 +86,7 @@ with st.sidebar:
 # buttons
 run_main = st.button("Run main pipeline (train & simulate)")
 
+
 # app.py (chunk 2/4) — helpers and candidate builder
 
 # Simple parsing helpers (if needed later)
@@ -198,6 +199,7 @@ def build_or_fetch_candidates(bars: pd.DataFrame, lookback: int = 64, max_bars: 
         candidates["label"] = np.nan
 
     return candidates
+
 
 # app.py (chunk 3/4) — main run, multi-model training, simulation
 
