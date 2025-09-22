@@ -28,6 +28,9 @@ def run_sweep(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = "GC=F"):
             logger.info("Sweep iteration %s: sell<%d, buy>%d", key, s, b)
             try:
                 df = clean.copy()
+                if "signal" not in df.columns:
+                    df["signal"] = (df.get("pred_prob", 0.0) * 10).round().astype(int)
+
                 df["pred_label"] = 0
                 df.loc[df["signal"] > b, "pred_label"] = 1
                 df.loc[df["signal"] < s, "pred_label"] = -1
@@ -44,10 +47,3 @@ def run_sweep(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = "GC=F"):
 
     logger.info("Sweep backtest finished with %d iterations.", len(results))
     return results
-
-# CLI entry
-if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    logger.addHandler(handler)
-    print("Run via app.py or import run_sweep")
